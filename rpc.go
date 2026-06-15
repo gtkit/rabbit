@@ -10,6 +10,17 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// resetRPCState 清除 RPC 回复队列状态，使 ensureReplyQueue 下次可重建。
+func (m *MQ) resetRPCState() {
+	if m == nil {
+		return
+	}
+	m.rpc.mu.Lock()
+	m.rpc.initialized = false
+	m.rpc.queueName = ""
+	m.rpc.mu.Unlock()
+}
+
 var (
 	// ErrRPCTimeout 在 RPC 调用超时时返回。
 	ErrRPCTimeout = errors.New("mq: RPC call timed out")
@@ -47,11 +58,12 @@ type RPCServer interface {
 }
 
 // rpcState 管理 RPC 调用所需的回复队列和待处理映射。
-// 通过 MQ.rpc 字段访问，首次 Call 时懒初始化。
+// 通过 MQ.rpc 字段访问，首次 Call 时懒初始化，连接断开后可自动重建。
 type rpcState struct {
-	once      sync.Once
-	queueName string // 独占自动删除的回复队列名
-	pending   sync.Map
+	mu          sync.Mutex
+	queueName   string // 独占自动删除的回复队列名
+	initialized bool   // 回复队列和消费者是否就绪
+	pending     sync.Map
 }
 
 // pendingReply 是 rpcState.pending 中存储的值类型。
@@ -60,43 +72,57 @@ type pendingReply struct {
 }
 
 // ensureReplyQueue 创建独占的回复队列并启动消费者。
-// 在同一个 MQ 实例上只执行一次。
+// 连接断开后回复队列自动消失，下次 Call 会自动重建。
+// 内部用互斥锁保护初始化路径，并发安全。
 func (m *MQ) ensureReplyQueue() error {
 	if m == nil {
 		return ErrNotInitialized
 	}
 
-	var initErr error
-	m.rpc.once.Do(func() {
-		ch, err := m.openConsumerChannel()
-		if err != nil {
-			initErr = err
-			return
-		}
+	m.rpc.mu.Lock()
+	if m.rpc.initialized && m.rpc.queueName != "" {
+		m.rpc.mu.Unlock()
+		return nil
+	}
+	m.rpc.mu.Unlock()
 
-		queue, err := ch.QueueDeclare("", false, false, true, false, nil)
-		if err != nil {
-			_ = ch.Close()
-			initErr = err
-			return
-		}
-		m.rpc.queueName = queue.Name
+	ch, err := m.openConsumerChannel()
+	if err != nil {
+		return err
+	}
 
-		deliveries, err := ch.Consume(queue.Name, "", true, false, false, false, nil)
-		if err != nil {
-			_ = ch.Close()
-			initErr = err
-			return
-		}
+	queue, err := ch.QueueDeclare("", false, false, true, false, nil)
+	if err != nil {
+		_ = ch.Close()
+		return err
+	}
 
-		go m.rpcReplyLoop(deliveries, ch)
-	})
-	return initErr
+	deliveries, err := ch.Consume(queue.Name, "", true, false, false, false, nil)
+	if err != nil {
+		_ = ch.Close()
+		return err
+	}
+
+	// 二次检查：避免两个并发 Call 都走到创建资源
+	m.rpc.mu.Lock()
+	if m.rpc.initialized && m.rpc.queueName != "" {
+		m.rpc.mu.Unlock()
+		_ = ch.Close()
+		return nil
+	}
+	m.rpc.queueName = queue.Name
+	m.rpc.initialized = true
+	m.rpc.mu.Unlock()
+
+	go m.rpcReplyLoop(deliveries, ch)
+	return nil
 }
 
 // rpcReplyLoop 在后台 goroutine 中消费回复队列的消息，按 correlation-id 分发到对应等待者。
+// 通道关闭时（连接断开 / channel 关闭）自动重置 initialized，下次 Call 重建。
 func (m *MQ) rpcReplyLoop(deliveries <-chan amqp.Delivery, ch *amqp.Channel) {
 	defer closeAMQPChannel(ch)
+	defer m.resetRPCState()
 
 	for d := range deliveries {
 		corrID := d.CorrelationId
