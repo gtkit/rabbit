@@ -97,6 +97,10 @@ func (m *MQ) dial() (*amqp.Connection, error) {
 		return nil, ErrNotInitialized
 	}
 
+	if m.opt.TLSConfig != nil {
+		maybeLogTLSWarning(m.opt.MQURL)
+	}
+
 	config := amqp.Config{
 		Vhost:           m.opt.Vhost,
 		Properties:      amqp.NewConnectionProperties(),
@@ -233,6 +237,31 @@ func copyHeaders(headers amqp.Table) amqp.Table {
 	maps.Copy(cloned, headers)
 
 	return cloned
+}
+
+// maybeLogTLSWarning 在提供了 TLS 配置但连接串未使用 amqps:// 时输出警告。
+func maybeLogTLSWarning(mqURL string) {
+	if strings.HasPrefix(mqURL, "amqps://") {
+		return
+	}
+
+	scheme := extractURLScheme(mqURL)
+	currentLogger().Infof("TLSConfig provided but connection URL uses %q (not amqps://); "+
+		"TLS may not be active. Use amqps:// scheme for encrypted connections.", scheme)
+}
+
+// extractURLScheme 提取 URL 中的 scheme 部分，便于日志输出。
+func extractURLScheme(rawURL string) string {
+	idx := strings.Index(rawURL, "://")
+	if idx <= 0 {
+		return rawURL
+	}
+	return rawURL[:idx+3]
+}
+
+// declareExchangeWithArgs 声明 exchange，支持传递额外参数。
+func declareExchangeWithArgs(ch *amqp.Channel, name, kind string, args amqp.Table) error {
+	return ch.ExchangeDeclare(name, kind, true, false, false, false, args)
 }
 
 // safeNamePart 把 exchange / routing key 等转换为可用作派生队列名的字符串。

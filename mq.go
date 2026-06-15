@@ -119,6 +119,12 @@ type MQOption struct {
 	// 高吞吐、可容忍消息丢失的场景可设为 1 以减少写入确认开销。
 	DeliveryMode uint8
 
+	// QueueArgs 是队列声明时的额外参数，如 x-message-ttl、x-max-length 等。
+	// 通过 WithQueueArgs 设置；若为 nil 则不附加额外参数。
+	QueueArgs amqp.Table
+	// ExchangeArgs 是交换机声明时的额外参数，通过 WithExchangeArg 设置。
+	ExchangeArgs amqp.Table
+
 	// 日志与回调注入。
 	Logger        Logger
 	PubFailNotify func(FailedMsg)
@@ -645,6 +651,118 @@ func (m *MQ) publishGeneric(req publishRequest) (msgID string, err error) {
 	}
 
 	return msgID, nil
+}
+
+// batchPublishGeneric 是所有 BatchPublish 的公共实现。
+// 在一个 channel 上快速发送多条消息，然后一次性等待所有确认。
+func (m *MQ) batchPublishGeneric(exchange, routingKey string, bodies [][]byte) ([]string, error) {
+	if len(bodies) == 0 {
+		return nil, nil
+	}
+
+	done, ok := m.trackPublish()
+	if !ok {
+		return nil, ErrDestroyed
+	}
+	defer done()
+
+	ctx := m.contextOrBackground()
+
+	var start time.Time
+	if m.opt.Observer != nil {
+		start = time.Now()
+	}
+
+	select {
+	case <-ctx.Done():
+		m.notifyPubFailed(m.failedMessage(nil, ""))
+		return nil, m.canceledError("publish batch")
+	default:
+	}
+
+	msgIDs := make([]string, len(bodies))
+	err := m.publishWithChannel(func(ch *amqp.Channel) error {
+		confs := make([]*amqp.DeferredConfirmation, len(bodies))
+
+		for i, body := range bodies {
+			msgID := uuid.NewString()
+			msgIDs[i] = msgID
+
+			pub := amqp.Publishing{
+				DeliveryMode: m.resolveDeliveryMode(),
+				ContentType:  "application/octet-stream",
+				MessageId:    msgID,
+				Body:         body,
+				Headers:      amqp.Table{"x-retry": int32(0)},
+			}
+
+			conf, pubErr := ch.PublishWithDeferredConfirmWithContext(
+				ctx, exchange, routingKey, true, false, pub,
+			)
+			if pubErr != nil {
+				return pubErr
+			}
+			confs[i] = conf
+		}
+
+		for i, conf := range confs {
+			if conf == nil {
+				continue
+			}
+			acked, cErr := conf.WaitContext(ctx)
+			if cErr != nil {
+				m.notifyPubFailed(m.failedMessage(bodies[i], msgIDs[i]))
+				return cErr
+			}
+			if !acked {
+				m.notifyPubFailed(m.failedMessage(bodies[i], msgIDs[i]))
+				return fmt.Errorf("msg %q: %w", msgIDs[i], ErrPublishNotAcknowledged)
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		m.emitPublish(PublishEvent{
+			Operation: "publish batch",
+			BodySize:  totalSizeBytes(bodies),
+			Duration:  time.Since(start),
+			Err:       err,
+		})
+		return msgIDs, err
+	}
+
+	m.emitPublish(PublishEvent{
+		Operation: "publish batch",
+		BodySize:  totalSizeBytes(bodies),
+		Duration:  time.Since(start),
+	})
+	return msgIDs, nil
+}
+
+// totalSizeBytes 计算 [][]byte 的总字节数。
+func totalSizeBytes(bodies [][]byte) int {
+	total := 0
+	for _, b := range bodies {
+		total += len(b)
+	}
+	return total
+}
+
+// resolveDeliveryMode 返回当前实例的有效投递模式。
+func (m *MQ) resolveDeliveryMode() uint8 {
+	if m == nil {
+		return amqp.Persistent
+	}
+	if m.opt.DeliveryMode != 0 {
+		return m.opt.DeliveryMode
+	}
+	return amqp.Persistent
+}
+
+// BatchPublish 批量发布多条消息到一个目标（队列或 exchange）。
+func (m *MQ) BatchPublish(bodies [][]byte) ([]string, error) {
+	return m.batchPublishGeneric(m.opt.ExchangeName, m.opt.RoutingKey, bodies)
 }
 
 // ParseURI 解析 RabbitMQ 连接串。

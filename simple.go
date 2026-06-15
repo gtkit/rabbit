@@ -84,6 +84,11 @@ func (s *MQSimple) PublishString(msg string) (string, error) {
 	return s.Publish([]byte(msg))
 }
 
+// BatchPublish 批量发布多条消息到简单队列。
+func (s *MQSimple) BatchPublish(bodies [][]byte) ([]string, error) {
+	return s.batchPublishGeneric("", s.opt.QueueName, bodies)
+}
+
 // PublishDelayString 是 PublishDelay 的便捷包装，自动将 string 转为 []byte。
 func (s *MQSimple) PublishDelayString(msg string, ttl time.Duration) (string, error) {
 	return s.PublishDelay([]byte(msg), ttl)
@@ -223,9 +228,11 @@ func (s *MQSimple) ConsumeDlx(handler MsgHandler) error {
 // declareQueue 在 ch 上声明 simple 主队列（按 simpleQueueMaxPriority 设置优先级）。
 // args 用于追加业务自定义 queue arguments（例如 x-dead-letter-exchange）。
 func (s *MQSimple) declareQueue(ch *amqp.Channel, args amqp.Table) (amqp.Queue, error) {
-	queueArgs := amqp.Table{
-		"x-max-priority": simpleQueueMaxPriority,
+	queueArgs := make(amqp.Table)
+	if s.opt.QueueArgs != nil {
+		maps.Copy(queueArgs, s.opt.QueueArgs)
 	}
+	queueArgs["x-max-priority"] = simpleQueueMaxPriority
 	maps.Copy(queueArgs, args)
 
 	return ch.QueueDeclare(s.opt.QueueName, true, false, false, false, queueArgs)

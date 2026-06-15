@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 // Option 用于在构造 RabbitMQ 实例时设置可选配置。
@@ -112,6 +113,31 @@ func WithTLSConfig(c *tls.Config) Option {
 func WithDeliveryMode(mode uint8) Option {
 	return func(option *MQOption) {
 		option.DeliveryMode = mode
+	}
+}
+
+// WithQueueArgs 设置队列声明时的额外参数，如 x-message-ttl、x-max-length 等。
+// 已设置的默认参数（如 x-max-priority）不会被覆盖。
+// 零值字段（0、空串）不会被写入，避免与 broker 默认行为冲突。
+func WithQueueArgs(args map[string]any) Option {
+	return func(option *MQOption) {
+		if option.QueueArgs == nil {
+			option.QueueArgs = make(amqp.Table, len(args))
+		}
+		for k, v := range args {
+			option.QueueArgs[k] = v
+		}
+	}
+}
+
+// WithExchangeArg 设置交换机声明时的单个额外参数。
+// 可多次调用，调用语义为"覆盖或追加"。
+func WithExchangeArg(key string, value any) Option {
+	return func(option *MQOption) {
+		if option.ExchangeArgs == nil {
+			option.ExchangeArgs = make(amqp.Table)
+		}
+		option.ExchangeArgs[key] = value
 	}
 }
 

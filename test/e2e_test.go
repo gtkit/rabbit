@@ -22,6 +22,8 @@ import (
 	"testing"
 	"time"
 
+	amqp "github.com/rabbitmq/amqp091-go"
+
 	"github.com/gtkit/rabbit"
 )
 
@@ -714,5 +716,390 @@ func TestE2EReconnectAfterConnectionClosed(t *testing.T) {
 	bodies := bytesSlice(got)
 	if bodies[0] != "before-kill" || bodies[1] != "after-reconnect" {
 		t.Fatalf("received order = %v, want [before-kill after-reconnect]", bodies)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// direct 模式 - retry
+// ----------------------------------------------------------------------------
+
+func TestE2EDirectRetry(t *testing.T) {
+	requireRabbitMQ(t)
+
+	exchange := uniqueName(t, "ex-direct-retry")
+	routing := "rk." + t.Name()
+	queue := uniqueName(t, "q-direct-retry")
+	t.Cleanup(func() {
+		deleteQueue(t, queue)
+		deleteQueue(t, queue+".retry")
+		deleteExchange(t, exchange)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	rec := newRecorder(1)
+	atomic.StoreInt32(&rec.failNext, 2)
+
+	cons, err := rabbit.NewConsumeDirect(exchange, routing, mqURL,
+		rabbit.WithContext(ctx),
+		rabbit.WithQueueName(queue),
+		rabbit.WithMaxRetry(5),
+		rabbit.WithRetryTTL(500*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	t.Cleanup(cons.Destroy)
+	go func() { _ = cons.Consume(rec) }()
+
+	waitQueueReady(t, queue)
+
+	pub, err := rabbit.NewPubDirect(exchange, routing, mqURL, rabbit.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("new publisher: %v", err)
+	}
+	t.Cleanup(pub.Destroy)
+
+	if _, err := pub.Publish([]byte("direct-retry")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	rec.waitReceived(t, 15*time.Second)
+
+	got := rec.snapshotReceived()
+	if len(got) != 1 || string(got[0]) != "direct-retry" {
+		t.Fatalf("received = %v, want [direct-retry]", bytesSlice(got))
+	}
+	if remaining := atomic.LoadInt32(&rec.failNext); remaining != 0 {
+		t.Fatalf("failNext = %d, want 0", remaining)
+	}
+}
+
+func TestE2EDirectDelay(t *testing.T) {
+	requireRabbitMQ(t)
+
+	exchange := uniqueName(t, "ex-direct-delay")
+	routing := "rk." + t.Name()
+	queue := uniqueName(t, "q-direct-delay")
+	t.Cleanup(func() {
+		deleteQueue(t, queue)
+		deleteQueue(t, queue+".delay")
+		deleteExchange(t, exchange)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	rec := newRecorder(1)
+
+	cons, err := rabbit.NewConsumeDirect(exchange, routing, mqURL,
+		rabbit.WithContext(ctx),
+		rabbit.WithQueueName(queue),
+	)
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	t.Cleanup(cons.Destroy)
+	go func() { _ = cons.Consume(rec) }()
+
+	waitQueueReady(t, queue)
+
+	pub, err := rabbit.NewPubDirect(exchange, routing, mqURL, rabbit.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("new publisher: %v", err)
+	}
+	t.Cleanup(pub.Destroy)
+
+	start := time.Now()
+	if _, err := pub.PublishDelay([]byte("direct-delayed"), 800*time.Millisecond); err != nil {
+		t.Fatalf("publish delay: %v", err)
+	}
+
+	rec.waitReceived(t, 10*time.Second)
+	if elapsed := time.Since(start); elapsed < 700*time.Millisecond {
+		t.Fatalf("message arrived too early: elapsed=%v", elapsed)
+	}
+}
+
+func TestE2EDirectFailToDlx(t *testing.T) {
+	requireRabbitMQ(t)
+
+	exchange := uniqueName(t, "ex-direct-dlx")
+	routing := "rk." + t.Name()
+	queue := uniqueName(t, "q-direct-dlx")
+	t.Cleanup(func() {
+		deleteQueue(t, queue)
+		deleteExchange(t, exchange)
+		deleteExchange(t, exchange+".dlx")
+		deleteQueue(t, queue+".dlq")
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	mainRec := newRecorder(1)
+	atomic.StoreInt32(&mainRec.failNext, 1)
+	dlqRec := newRecorder(1)
+
+	main, err := rabbit.NewConsumeDirect(exchange, routing, mqURL,
+		rabbit.WithContext(ctx),
+		rabbit.WithQueueName(queue),
+	)
+	if err != nil {
+		t.Fatalf("new main consumer: %v", err)
+	}
+	t.Cleanup(main.Destroy)
+	go func() { _ = main.ConsumeFailToDlx(mainRec) }()
+
+	dlqConsumer, err := rabbit.NewConsumeDirect(exchange, routing, mqURL,
+		rabbit.WithContext(ctx),
+		rabbit.WithQueueName(queue),
+	)
+	if err != nil {
+		t.Fatalf("new dlq consumer: %v", err)
+	}
+	t.Cleanup(dlqConsumer.Destroy)
+	go func() { _ = dlqConsumer.ConsumeDlx(dlqRec) }()
+
+	waitQueueReady(t, queue)
+
+	pub, err := rabbit.NewPubDirect(exchange, routing, mqURL, rabbit.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("new publisher: %v", err)
+	}
+	t.Cleanup(pub.Destroy)
+
+	if _, err := pub.PublishWithDlx([]byte("direct-to-dlx")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	dlqRec.waitReceived(t, 15*time.Second)
+
+	got := dlqRec.snapshotReceived()
+	if len(got) != 1 || string(got[0]) != "direct-to-dlx" {
+		t.Fatalf("dlq received = %v, want [direct-to-dlx]", bytesSlice(got))
+	}
+}
+
+// ----------------------------------------------------------------------------
+// topic 模式 - retry & delay
+// ----------------------------------------------------------------------------
+
+func TestE2ETopicRetry(t *testing.T) {
+	requireRabbitMQ(t)
+
+	exchange := uniqueName(t, "ex-topic-retry")
+	routing := "rk." + t.Name()
+	queue := uniqueName(t, "q-topic-retry")
+	t.Cleanup(func() {
+		deleteQueue(t, queue)
+		deleteQueue(t, queue+".retry")
+		deleteExchange(t, exchange)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	rec := newRecorder(1)
+	atomic.StoreInt32(&rec.failNext, 2)
+
+	cons, err := rabbit.NewConsumeTopic(exchange, routing, mqURL,
+		rabbit.WithContext(ctx),
+		rabbit.WithQueueName(queue),
+		rabbit.WithMaxRetry(5),
+		rabbit.WithRetryTTL(500*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	t.Cleanup(cons.Destroy)
+	go func() { _ = cons.Consume(rec) }()
+
+	waitQueueReady(t, queue)
+
+	pub, err := rabbit.NewPubTopic(exchange, routing, mqURL, rabbit.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("new publisher: %v", err)
+	}
+	t.Cleanup(pub.Destroy)
+
+	if _, err := pub.Publish([]byte("topic-retry")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	rec.waitReceived(t, 15*time.Second)
+
+	got := rec.snapshotReceived()
+	if len(got) != 1 || string(got[0]) != "topic-retry" {
+		t.Fatalf("received = %v, want [topic-retry]", bytesSlice(got))
+	}
+	if remaining := atomic.LoadInt32(&rec.failNext); remaining != 0 {
+		t.Fatalf("failNext = %d, want 0", remaining)
+	}
+}
+
+func TestE2ETopicDelay(t *testing.T) {
+	requireRabbitMQ(t)
+
+	exchange := uniqueName(t, "ex-topic-delay")
+	routing := "rk." + t.Name()
+	queue := uniqueName(t, "q-topic-delay")
+	t.Cleanup(func() {
+		deleteQueue(t, queue)
+		deleteQueue(t, queue+".delay")
+		deleteExchange(t, exchange)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	rec := newRecorder(1)
+
+	cons, err := rabbit.NewConsumeTopic(exchange, routing, mqURL,
+		rabbit.WithContext(ctx),
+		rabbit.WithQueueName(queue),
+	)
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	t.Cleanup(cons.Destroy)
+	go func() { _ = cons.Consume(rec) }()
+
+	waitQueueReady(t, queue)
+
+	pub, err := rabbit.NewPubTopic(exchange, routing, mqURL, rabbit.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("new publisher: %v", err)
+	}
+	t.Cleanup(pub.Destroy)
+
+	start := time.Now()
+	if _, err := pub.PublishDelay([]byte("topic-delayed"), 800*time.Millisecond); err != nil {
+		t.Fatalf("publish delay: %v", err)
+	}
+
+	rec.waitReceived(t, 10*time.Second)
+	if elapsed := time.Since(start); elapsed < 700*time.Millisecond {
+		t.Fatalf("message arrived too early: elapsed=%v", elapsed)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// fanout 模式 - DLX
+// ----------------------------------------------------------------------------
+
+func TestE2EFanoutFailToDlx(t *testing.T) {
+	requireRabbitMQ(t)
+
+	exchange := uniqueName(t, "ex-fanout-dlx")
+	queue := uniqueName(t, "q-fanout-dlx")
+	t.Cleanup(func() {
+		deleteQueue(t, queue)
+		deleteExchange(t, exchange)
+		deleteExchange(t, exchange+".dlx")
+		deleteQueue(t, queue+".dlq")
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	mainRec := newRecorder(1)
+	atomic.StoreInt32(&mainRec.failNext, 1)
+	dlqRec := newRecorder(1)
+
+	main, err := rabbit.NewConsumeFanout(exchange, mqURL,
+		rabbit.WithContext(ctx),
+		rabbit.WithQueueName(queue),
+	)
+	if err != nil {
+		t.Fatalf("new main consumer: %v", err)
+	}
+	t.Cleanup(main.Destroy)
+	go func() { _ = main.ConsumeFailToDlx(mainRec) }()
+
+	dlqConsumer, err := rabbit.NewConsumeFanout(exchange, mqURL,
+		rabbit.WithContext(ctx),
+		rabbit.WithQueueName(queue),
+	)
+	if err != nil {
+		t.Fatalf("new dlq consumer: %v", err)
+	}
+	t.Cleanup(dlqConsumer.Destroy)
+	go func() { _ = dlqConsumer.ConsumeDlx(dlqRec) }()
+
+	waitQueueReady(t, queue)
+
+	pub, err := rabbit.NewPubFanout(exchange, mqURL, rabbit.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("new publisher: %v", err)
+	}
+	t.Cleanup(pub.Destroy)
+
+	if _, err := pub.PublishWithDlx([]byte("fanout-to-dlx")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	dlqRec.waitReceived(t, 15*time.Second)
+
+	got := dlqRec.snapshotReceived()
+	if len(got) != 1 || string(got[0]) != "fanout-to-dlx" {
+		t.Fatalf("dlq received = %v, want [fanout-to-dlx]", bytesSlice(got))
+	}
+}
+
+// ----------------------------------------------------------------------------
+// headers 模式
+// ----------------------------------------------------------------------------
+
+func TestE2EHeadersPublishConsume(t *testing.T) {
+	requireRabbitMQ(t)
+
+	exchange := uniqueName(t, "ex-headers")
+	queue := uniqueName(t, "q-headers")
+	t.Cleanup(func() {
+		deleteQueue(t, queue)
+		deleteExchange(t, exchange)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	binding := rabbit.HeaderBinding{
+		MatchAll: false,
+		Headers:  map[string]any{"format": "json", "type": "event"},
+	}
+	rec := newRecorder(2)
+
+	cons, err := rabbit.NewConsumeHeaders(exchange, binding, mqURL,
+		rabbit.WithContext(ctx),
+		rabbit.WithQueueName(queue),
+	)
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	t.Cleanup(cons.Destroy)
+	go func() { _ = cons.Consume(rec) }()
+
+	waitQueueReady(t, queue)
+
+	pub, err := rabbit.NewPubHeaders(exchange, mqURL, rabbit.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("new publisher: %v", err)
+	}
+	t.Cleanup(pub.Destroy)
+
+	if _, err := pub.PublishWithHeaders([]byte("match-json"), amqp.Table{"format": "json", "type": "event"}); err != nil {
+		t.Fatalf("publish match: %v", err)
+	}
+	if _, err := pub.PublishWithHeaders([]byte("match-event"), amqp.Table{"type": "event"}); err != nil {
+		t.Fatalf("publish match event: %v", err)
+	}
+
+	rec.waitReceived(t, 10*time.Second)
+
+	got := rec.snapshotReceived()
+	if len(got) != 2 {
+		t.Fatalf("received = %d, want 2: %v", len(got), bytesSlice(got))
 	}
 }

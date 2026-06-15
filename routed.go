@@ -90,6 +90,37 @@ func (r *routedMQ) Consume(handler MsgHandler) error {
 	})
 }
 
+// PublishWithDlxString 是 PublishWithDlx 的字符串便捷包装。
+func (r *routedMQ) PublishWithDlxString(msg string) (string, error) {
+	return r.PublishWithDlx([]byte(msg))
+}
+
+// PublishWithDlx 在声明死信拓扑后向主 exchange 发布消息。
+func (r *routedMQ) PublishWithDlx(body []byte) (string, error) {
+	headers := amqp.Table{"x-retry": int32(0)}
+
+	return r.publishGeneric(publishRequest{
+		operation:  "publish with dlx",
+		body:       body,
+		exchange:   r.opt.ExchangeName,
+		routingKey: r.opt.RoutingKey,
+		mandatory:  true,
+		headers:    headers,
+		declares: []declareStep{
+			{cacheKey: "exchange", declare: r.declareExchange},
+			{cacheKey: "dlx-topology", declare: func(ch *amqp.Channel) error {
+				_, _, err := r.declareDLXTopology(ch)
+				return err
+			}},
+		},
+	})
+}
+
+// BatchPublish 批量发布多条消息到 exchange。
+func (r *routedMQ) BatchPublish(bodies [][]byte) ([]string, error) {
+	return r.batchPublishGeneric(r.opt.ExchangeName, r.opt.RoutingKey, bodies)
+}
+
 // RetryMsg 将当前 delivery 手动发送到 retry queue。
 func (r *routedMQ) RetryMsg(msg amqp.Delivery, ttl time.Duration) error {
 	done, ok := r.trackPublish()
@@ -165,7 +196,7 @@ func (r *routedMQ) ConsumeDlx(handler MsgHandler) error {
 
 // declareExchange 按 exchangeKind 声明业务 exchange。
 func (r *routedMQ) declareExchange(ch *amqp.Channel) error {
-	return ch.ExchangeDeclare(r.opt.ExchangeName, r.exchangeKind, true, false, false, false, nil)
+	return declareExchangeWithArgs(ch, r.opt.ExchangeName, r.exchangeKind, r.opt.ExchangeArgs)
 }
 
 // declareBoundQueue 声明主队列并把它绑定到业务 exchange + routingKey 上。
@@ -175,9 +206,11 @@ func (r *routedMQ) declareBoundQueue(ch *amqp.Channel, args amqp.Table) (amqp.Qu
 		return amqp.Queue{}, err
 	}
 
-	queueArgs := amqp.Table{
-		"x-max-priority": simpleQueueMaxPriority,
+	queueArgs := make(amqp.Table)
+	if r.opt.QueueArgs != nil {
+		maps.Copy(queueArgs, r.opt.QueueArgs)
 	}
+	queueArgs["x-max-priority"] = simpleQueueMaxPriority
 	maps.Copy(queueArgs, args)
 
 	queue, err := ch.QueueDeclare(r.opt.QueueName, true, false, false, false, queueArgs)
