@@ -1,0 +1,114 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  concurrency: 0
+  build-tags:
+    - sonic
+
+output:
+  formats:
+    text:
+      path: stdout
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - errchkjson
+    - errname
+    - govet
+    - ineffassign
+    - nilerr
+    - nilnesserr
+    - staticcheck
+    - unused
+    - gocheckcompilerdirectives
+    - gosec
+    - misspell
+    - nolintlint
+    - predeclared
+    - revive
+    - unconvert
+    - unparam
+    - wastedassign
+    - whitespace
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+
+    staticcheck:
+      checks:
+        - all
+        - "-ST1000"
+        - "-ST1003"
+
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+          arguments:
+            - checkPrivateReceivers
+        - name: if-return
+        - name: increment-decrement
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: unreachable-code
+        - name: var-declaration
+        - name: var-naming
+
+    gosec:
+      excludes:
+        - G104
+
+    misspell:
+      locale: US
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+  exclusions:
+    generated: lax
+    warn-unused: true
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - path: '(.+)_test\.go'
+        linters: [gosec]
+      - path: '^examples/'
+        linters: [gosec, mnd]
+      - path: '^test/'
+        linters: [gosec]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: strict
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  uniq-by-line: true
+  new: false
+  fix: false
