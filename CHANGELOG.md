@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 ## [Unreleased]
 
 ### Added
+
+## [1.1.0] - 2026-06-15
+
+### Added
+- RPC 模式（`Call` / `ServeRPC` + `RPCHandler` / `RPCCallPublisher` / `RPCServer` 接口），支持 simple/direct/topic/headers
 - Headers Exchange 模式支持（`NewHeaders` / `NewPubHeaders` / `NewConsumeHeaders`）
 - `WithQueueArgs` / `WithExchangeArg` Option，自定义 queue/exchange 声明参数
 - `BatchPublish` 批量发布方法
