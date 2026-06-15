@@ -7,6 +7,8 @@ import (
 var _ MQInterface = (*MQDirect)(nil)
 var _ Publisher = (*MQDirect)(nil)
 var _ Consumer = (*MQDirect)(nil)
+var _ RPCCallPublisher = (*MQDirect)(nil)
+var _ RPCServer = (*MQDirect)(nil)
 
 // MQDirect 是 direct exchange 模式的客户端。
 type MQDirect struct {

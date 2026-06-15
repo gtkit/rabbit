@@ -275,6 +275,8 @@ mq, err := rabbit.NewPubSimple(
 | `ConsumeFailToDlx(handler) error` | 失败直接进入 DLX |
 | `ConsumeDlx(handler) error` | 消费死信队列 |
 | `RetryMsg(msg amqp.Delivery, ttl time.Duration) error` | 手动把当前 delivery 投入 retry queue |
+| `Call(body []byte) ([]byte, error)` | RPC 请求并等待应答 |
+| `ServeRPC(handler RPCHandler) error` | 作为 RPC 服务端处理请求 |
 | `BatchPublish(bodies [][]byte) ([]string, error)` | 批量发布 |
 
 ### Direct
@@ -294,6 +296,8 @@ mq, err := rabbit.NewPubSimple(
 | `ConsumeFailToDlx(handler) error` | 失败直接 DLX |
 | `ConsumeDlx(handler) error` | 消费死信队列 |
 | `RetryMsg(msg amqp.Delivery, ttl time.Duration) error` | 手动投 retry |
+| `Call(body []byte) ([]byte, error)` | RPC 请求并等待应答 |
+| `ServeRPC(handler RPCHandler) error` | 作为 RPC 服务端处理请求 |
 | `BatchPublish(bodies [][]byte) ([]string, error)` | 批量发布 |
 
 ### Fanout
@@ -331,6 +335,8 @@ mq, err := rabbit.NewPubSimple(
 | `ConsumeFailToDlx(handler) error` | 失败直接 DLX |
 | `ConsumeDlx(handler) error` | 消费死信队列 |
 | `RetryMsg(msg amqp.Delivery, ttl time.Duration) error` | 手动投 retry |
+| `Call(body []byte) ([]byte, error)` | RPC 请求并等待应答 |
+| `ServeRPC(handler RPCHandler) error` | 作为 RPC 服务端处理请求 |
 | `BatchPublish(bodies [][]byte) ([]string, error)` | 批量发布 |
 
 ### Headers
@@ -380,6 +386,8 @@ mq, err := rabbit.NewPubSimple(
 - `examples/topic/consumer/main.go` （topic 消费）
 - `examples/headers/producer/main.go` （headers 发布）
 - `examples/headers/consumer/main.go` （headers 消费）
+- `examples/rpc/client/main.go` （RPC 客户端）
+- `examples/rpc/server/main.go` （RPC 服务端）
 
 本地运行（需先启动 RabbitMQ）：
 
@@ -559,6 +567,8 @@ func init() {
 | `Consumer` | `Consume`、`ConsumeFailToDlx`、`ConsumeDlx` | 只收不发 |
 | `MQInterface` | `Publish` + `Consume` + `PublishDelay` + `ConsumeFailToDlx` + `ConsumeDlx` | 收发一体 |
 | `Retrier` | `RetryMsg` | 手动重试（simple/direct/topic 实现，fanout 不实现） |
+| `RPCCallPublisher` | `Call` | RPC 请求-应答（simple/direct/topic/headers 实现） |
+| `RPCServer` | `ServeRPC` | RPC 服务端接收请求并回复（simple/direct/topic/headers 实现） |
 
 测试或 mock 时可以只 mock 需要的接口，不必 mock 整个实例。
 
@@ -703,7 +713,92 @@ for i, id := range msgIDs {
 }
 ```
 
-## 十六、测试
+### 8. RPC 模式示例
+
+RPC 客户端（发起请求并等待应答）：
+
+```go
+mq, _ := rabbit.NewPubSimple(
+    "rpc.queue",
+    "amqp://guest:guest@127.0.0.1:5672/",
+)
+defer mq.Destroy()
+
+reply, err := mq.Call([]byte("ping"))
+// reply = []byte("pong")
+```
+
+RPC 服务端（处理请求并回复）：
+
+```go
+mq, _ := rabbit.NewConsumeSimple(
+    "rpc.queue",
+    "amqp://guest:guest@127.0.0.1:5672/",
+)
+defer mq.Destroy()
+
+_ = mq.ServeRPC(rabbit.RPCHandlerFunc(func(body []byte) ([]byte, error) {
+    return []byte("pong"), nil
+}))
+```
+
+支持 RPC 的模式：simple / direct / topic / headers。fanout 不支持。
+
+## 十六、RPC 模式
+
+RPC（Remote Procedure Call）是 RabbitMQ 的经典请求-应答模式。客户端发送请求到指定队列或 exchange，
+服务端消费请求、执行处理、把结果发回客户端。
+
+### 工作原理
+
+```
+客户端                         服务端
+  |                             |
+  |--- 请求 (routing_key) ----->|
+  |   reply-to: <独占回复队列>    |
+  |   correlation-id: <UUID>    |
+  |                             |
+  |<--- 应答 (reply-to 队列) ----|
+  |   correlation-id: <UUID>    |
+```
+
+### 客户端 `Call(body) ([]byte, error)`
+
+`Call` 发送请求 body 到目标队列（simple）或 exchange（direct/topic/headers），
+同时创建一个独占的回复队列接收服务端应答。内部用 `correlation-id` 匹配请求和应答。
+
+- 每个 MQ 实例共享一个回复队列（首次调用时创建）
+- 默认超时 30 秒，可通过实例的 `context.WithTimeout` 设置 deadline
+- 返回 `ErrRPCTimeout` 在超时时
+- 并发安全：多个 goroutine 可同时调用 `Call`，通过 `correlation-id` 区分应答
+
+### 服务端 `ServeRPC(handler) error`
+
+`ServeRPC` 持续消费队列中的请求，处理并回复。它和普通 `Consume` 共用同一套拓扑声明 + 断线重连机制。
+不同之处在于：
+
+- 处理成功：回复到 `msg.ReplyTo` + `Ack`
+- 处理失败：`Reject(false)`，不回复
+- 回复发布失败：`Nack(false, true)` 重新入队
+
+### RPCHandler
+
+提供接口和函数适配器两种写法：
+
+```go
+// 接口实现
+type myHandler struct{}
+func (h *myHandler) Handle(body []byte) ([]byte, error) {
+    return append([]byte("resp:"), body...), nil
+}
+
+// 函数适配器（推荐）
+handler := rabbit.RPCHandlerFunc(func(body []byte) ([]byte, error) {
+    return []byte("pong"), nil
+})
+```
+
+## 十七、测试
 
 ### 1. 单元测试（不依赖 RabbitMQ）
 
@@ -731,7 +826,7 @@ MQ_INTEGRATION=1 MQ_URL=amqp://guest:guest@127.0.0.1:5672/ go test ./test -count
 
 未设置 `MQ_INTEGRATION=1` 时，`./test` 下的用例会跳过。
 
-## 十七、永久错误 fast-fail
+## 十八、永久错误 fast-fail
 
 库内置了"协议层永久错误"快速失败机制。基于 `amqp091-go v1.11+` 提供的
 `*amqp.Error.Temporary()` 协议错误码分类，库内部能识别 broker 端"重试无效、需要外部干预"的错误：
@@ -754,6 +849,6 @@ if errors.Is(err, rabbit.ErrPermanent) {
 
 `ReconnectEvent` 也带 `Permanent bool` 字段，Observer 可以在监控面板上区分"普通重连"和"已退出的硬错误"。
 
-## 十八、版本
+## 十九、版本
 
 当前 `v1.0.0`。

@@ -17,6 +17,8 @@ var _ MQInterface = (*MQSimple)(nil)
 var _ Publisher = (*MQSimple)(nil)
 var _ Consumer = (*MQSimple)(nil)
 var _ Retrier = (*MQSimple)(nil)
+var _ RPCCallPublisher = (*MQSimple)(nil)
+var _ RPCServer = (*MQSimple)(nil)
 
 // MQSimple 是 simple 模式（无 exchange，直接发送到指定队列）的客户端。
 type MQSimple struct {
@@ -82,6 +84,25 @@ func MustNewSimple(queueName string, cfg MQOption) *MQSimple {
 // PublishString 是 Publish 的便捷包装，自动将 string 转为 []byte。
 func (s *MQSimple) PublishString(msg string) (string, error) {
 	return s.Publish([]byte(msg))
+}
+
+// Call 发送 RPC 请求到简单队列并等待应答。
+// 请求被发往主队列（未通过 exchange）；服务端处理完后将回复发回内部独占回复队列。
+// 默认超时 30 秒，可通过实例的 context 设置 deadline 控制。
+func (s *MQSimple) Call(body []byte) ([]byte, error) {
+	return s.callGeneric("", s.opt.QueueName, body)
+}
+
+// ServeRPC 作为 RPC 服务端持续消费主队列中的请求。
+// handler 处理请求并返回应答 body，返回 error 时消息被拒绝（不回复）。
+func (s *MQSimple) ServeRPC(handler RPCHandler) error {
+	return s.serveRPCLoop(handler, consumerConfig{
+		operation: "rpc serve",
+		logTag:    "simple rpc server",
+		declare: func(ch *amqp.Channel) (amqp.Queue, error) {
+			return s.declareQueue(ch, nil)
+		},
+	})
 }
 
 // BatchPublish 批量发布多条消息到简单队列。

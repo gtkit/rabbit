@@ -7,6 +7,8 @@ import (
 var _ MQInterface = (*MQTopic)(nil)
 var _ Publisher = (*MQTopic)(nil)
 var _ Consumer = (*MQTopic)(nil)
+var _ RPCCallPublisher = (*MQTopic)(nil)
+var _ RPCServer = (*MQTopic)(nil)
 
 // MQTopic 是 topic exchange 模式的客户端。
 type MQTopic struct {

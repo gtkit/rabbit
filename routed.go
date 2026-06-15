@@ -121,6 +121,25 @@ func (r *routedMQ) BatchPublish(bodies [][]byte) ([]string, error) {
 	return r.batchPublishGeneric(r.opt.ExchangeName, r.opt.RoutingKey, bodies)
 }
 
+// Call 发送 RPC 请求到 exchange 并等待应答。
+// 请求通过 exchange + routingKey 路由到服务端；服务端将回复发回内部独占回复队列。
+// 默认超时 30 秒，可通过实例的 context 设置 deadline 控制。
+func (r *routedMQ) Call(body []byte) ([]byte, error) {
+	return r.callGeneric(r.opt.ExchangeName, r.opt.RoutingKey, body)
+}
+
+// ServeRPC 作为 RPC 服务端持续消费主队列中的请求。
+// handler 处理请求并返回应答 body，返回 error 时消息被拒绝（不回复）。
+func (r *routedMQ) ServeRPC(handler RPCHandler) error {
+	return r.serveRPCLoop(handler, consumerConfig{
+		operation: "rpc serve",
+		logTag:    r.exchangeKind + " rpc server",
+		declare: func(ch *amqp.Channel) (amqp.Queue, error) {
+			return r.declareBoundQueue(ch, nil)
+		},
+	})
+}
+
 // RetryMsg 将当前 delivery 手动发送到 retry queue。
 func (r *routedMQ) RetryMsg(msg amqp.Delivery, ttl time.Duration) error {
 	done, ok := r.trackPublish()

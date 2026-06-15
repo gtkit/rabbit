@@ -153,6 +153,9 @@ type MQ struct {
 	publishWG sync.WaitGroup
 	closeOnce sync.Once
 	cancel    context.CancelFunc
+
+	// RPC 状态：reply queue + pending 映射，通过 EnsureReplyQueue 懒初始化。
+	rpc rpcState
 }
 
 // MsgHandler 定义了消费端的消息处理器。

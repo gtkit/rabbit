@@ -14,6 +14,8 @@ var _ MQInterface = (*MQHeaders)(nil)
 var _ Publisher = (*MQHeaders)(nil)
 var _ Consumer = (*MQHeaders)(nil)
 var _ Retrier = (*MQHeaders)(nil)
+var _ RPCCallPublisher = (*MQHeaders)(nil)
+var _ RPCServer = (*MQHeaders)(nil)
 
 // HeaderBinding 描述 headers exchange 绑定时需要的匹配条件。
 // MatchAll=true 对应 x-match=all（需全部匹配），MatchAll=false 对应 x-match=any（任一匹配）。
@@ -98,6 +100,25 @@ func MustNewHeaders(exchangeName string, binding HeaderBinding, cfg MQOption) *M
 		panic(err)
 	}
 	return mq
+}
+
+// Call 发送 RPC 请求到 headers exchange 并等待应答。
+// 请求通过 headers exchange 路由到服务端；服务端将回复发回内部独占回复队列。
+// 默认超时 30 秒，可通过实例的 context 设置 deadline 控制。
+func (h *MQHeaders) Call(body []byte) ([]byte, error) {
+	return h.callGeneric(h.opt.ExchangeName, "", body)
+}
+
+// ServeRPC 作为 RPC 服务端持续消费主队列中的请求。
+// handler 处理请求并返回应答 body，返回 error 时消息被拒绝（不回复）。
+func (h *MQHeaders) ServeRPC(handler RPCHandler) error {
+	return h.serveRPCLoop(handler, consumerConfig{
+		operation: "rpc serve",
+		logTag:    "headers rpc server",
+		declare: func(ch *amqp.Channel) (amqp.Queue, error) {
+			return h.declareBoundQueue(ch, nil)
+		},
+	})
 }
 
 // PublishString 是 PublishWithHeaders 的便捷包装（不带额外 headers），

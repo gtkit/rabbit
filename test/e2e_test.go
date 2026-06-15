@@ -1103,3 +1103,99 @@ func TestE2EHeadersPublishConsume(t *testing.T) {
 		t.Fatalf("received = %d, want 2: %v", len(got), bytesSlice(got))
 	}
 }
+
+// ----------------------------------------------------------------------------
+// simple RPC
+// ----------------------------------------------------------------------------
+
+func TestE2ESimpleRPC(t *testing.T) {
+	requireRabbitMQ(t)
+
+	queue := uniqueName(t, "q-rpc")
+	t.Cleanup(func() { deleteQueue(t, queue) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	server, err := rabbit.NewConsumeSimple(queue, mqURL, rabbit.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	t.Cleanup(server.Destroy)
+
+	serverDone := make(chan struct{})
+	go func() {
+		_ = server.ServeRPC(rabbit.RPCHandlerFunc(func(body []byte) ([]byte, error) {
+			return append([]byte("reply:"), body...), nil
+		}))
+		close(serverDone)
+	}()
+
+	client, err := rabbit.NewPubSimple(queue, mqURL, rabbit.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	t.Cleanup(client.Destroy)
+
+	waitQueueReady(t, queue)
+
+	reply, err := client.Call([]byte("hello"))
+	if err != nil {
+		t.Fatalf("Call error: %v", err)
+	}
+	if string(reply) != "reply:hello" {
+		t.Fatalf("Call reply = %q, want reply:hello", string(reply))
+	}
+
+	cancel()
+	select {
+	case <-serverDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not exit after ctx cancel")
+	}
+}
+
+func TestE2EDirectRPC(t *testing.T) {
+	requireRabbitMQ(t)
+
+	exchange := uniqueName(t, "ex-rpc")
+	routing := "rk." + t.Name()
+	queue := uniqueName(t, "q-rpc")
+	t.Cleanup(func() {
+		deleteQueue(t, queue)
+		deleteExchange(t, exchange)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	server, err := rabbit.NewConsumeDirect(exchange, routing, mqURL,
+		rabbit.WithContext(ctx),
+		rabbit.WithQueueName(queue),
+	)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	t.Cleanup(server.Destroy)
+	go func() {
+		_ = server.ServeRPC(rabbit.RPCHandlerFunc(func(body []byte) ([]byte, error) {
+			return append([]byte("echo:"), body...), nil
+		}))
+	}()
+
+	client, err := rabbit.NewPubDirect(exchange, routing, mqURL, rabbit.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	t.Cleanup(client.Destroy)
+
+	waitQueueReady(t, queue)
+
+	reply, err := client.Call([]byte("direct-rpc"))
+	if err != nil {
+		t.Fatalf("Call error: %v", err)
+	}
+	if string(reply) != "echo:direct-rpc" {
+		t.Fatalf("Call reply = %q, want echo:direct-rpc", string(reply))
+	}
+}
