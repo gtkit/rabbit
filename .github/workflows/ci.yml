@@ -25,9 +25,11 @@ jobs:
         run: go vet ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        # 项目使用 golangci-lint v2 配置（.golangci.yml version: "2"），
+        # 需 action@v7+；版本钉到与本地一致，避免 CI 与本地结果漂移。
+        uses: golangci/golangci-lint-action@v7
         with:
-          version: latest
+          version: v2.11.4
 
       - name: 离线单测（-race，集成测试自动跳过）
         run: go test -race -count=1 -timeout=5m ./...
