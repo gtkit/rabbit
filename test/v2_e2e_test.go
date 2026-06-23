@@ -541,3 +541,108 @@ func TestV2QuorumOverClassicFailsPermanent(t *testing.T) {
 		t.Fatal("Consume did not fast-fail on queue type conflict")
 	}
 }
+
+// ----------------------------------------------------------------------------
+// RPC 边界（补充 e2e 的 happy-path 之外的路径）
+// ----------------------------------------------------------------------------
+
+func TestV2RPCCallTimeout(t *testing.T) {
+	requireRabbitMQ(t)
+
+	queue := uniqueName(t, "q-rpc-timeout")
+	t.Cleanup(func() { deleteQueue(t, queue) })
+
+	// 短 deadline 的 ctx 让 Call 快速超时；没有任何 ServeRPC 服务端。
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	t.Cleanup(cancel)
+
+	client, err := rabbit.NewPubSimple(queue, mqURL, rabbit.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	t.Cleanup(client.Destroy)
+
+	_, callErr := client.Call([]byte("nobody-home"))
+	if !errors.Is(callErr, rabbit.ErrRPCTimeout) {
+		t.Fatalf("Call() error = %v, want ErrRPCTimeout", callErr)
+	}
+}
+
+func TestV2RPCServerHandlerErrorNoReply(t *testing.T) {
+	requireRabbitMQ(t)
+
+	queue := uniqueName(t, "q-rpc-handlererr")
+	t.Cleanup(func() { deleteQueue(t, queue) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	t.Cleanup(cancel)
+
+	// 服务端 handler 始终返回 error → 不发送应答。
+	server, err := rabbit.NewConsumeSimple(queue, mqURL, rabbit.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	t.Cleanup(server.Destroy)
+	go func() {
+		_ = server.ServeRPC(rabbit.RPCHandlerFunc(func([]byte) ([]byte, error) {
+			return nil, errors.New("boom")
+		}))
+	}()
+	waitQueueReady(t, queue)
+
+	client, err := rabbit.NewPubSimple(queue, mqURL, rabbit.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	t.Cleanup(client.Destroy)
+
+	// 服务端拒绝、不回复 → 客户端应超时，而非永久阻塞或 panic。
+	_, callErr := client.Call([]byte("req"))
+	if !errors.Is(callErr, rabbit.ErrRPCTimeout) {
+		t.Fatalf("Call() error = %v, want ErrRPCTimeout (handler error must not reply)", callErr)
+	}
+}
+
+func TestV2RPCReplyQueueRebuildAfterReconnect(t *testing.T) {
+	requireRabbitMQ(t)
+
+	queue := uniqueName(t, "q-rpc-reconnect")
+	t.Cleanup(func() { deleteQueue(t, queue) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	server, err := rabbit.NewConsumeSimple(queue, mqURL, rabbit.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	t.Cleanup(server.Destroy)
+	go func() {
+		_ = server.ServeRPC(rabbit.RPCHandlerFunc(func(body []byte) ([]byte, error) {
+			return append([]byte("reply:"), body...), nil
+		}))
+	}()
+
+	client, err := rabbit.NewPubSimple(queue, mqURL, rabbit.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	t.Cleanup(client.Destroy)
+	waitQueueReady(t, queue)
+
+	// 第一次 Call 建立独占回复队列。
+	reply, err := client.Call([]byte("a"))
+	if err != nil || string(reply) != "reply:a" {
+		t.Fatalf("first Call = %q, %v; want reply:a", string(reply), err)
+	}
+
+	// 断开所有连接：独占回复队列随连接消失。
+	closeAllConnections(t)
+	time.Sleep(3 * time.Second) // 等服务端与客户端各自重连
+
+	// 第二次 Call 必须自动重建回复队列并成功（回归 commit 5bf0382 的修复）。
+	reply, err = client.Call([]byte("b"))
+	if err != nil || string(reply) != "reply:b" {
+		t.Fatalf("Call after reconnect = %q, %v; want reply:b (reply queue must rebuild)", string(reply), err)
+	}
+}
