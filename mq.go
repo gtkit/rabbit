@@ -48,6 +48,12 @@ var (
 	// ErrPublishNotAcknowledged 在 broker 回复 nack 时返回（confirm 通道收到 false）。
 	ErrPublishNotAcknowledged = errors.New("mq: publish not acknowledged by broker")
 
+	// ErrPublishReturned 在以 mandatory 发布的消息无法路由到任何队列、
+	// 被 broker 退回（basic.return）时返回。
+	// 调用方可用 errors.Is(err, ErrPublishReturned) 判定。
+	// 注意：fanout 广播在无任何绑定队列时也会触发该错误。
+	ErrPublishReturned = errors.New("mq: publish returned by broker (message unroutable)")
+
 	// ErrConnectionNotInitialized 在尝试使用尚未建立的 connection 时返回。
 	ErrConnectionNotInitialized = errors.New("mq: connection is not initialized")
 
@@ -125,6 +131,24 @@ type MQOption struct {
 	// ExchangeArgs 是交换机声明时的额外参数，通过 WithExchangeArg 设置。
 	ExchangeArgs amqp.Table
 
+	// QueueType 是主队列类型（classic/quorum/stream），通过 WithQueueType 设置。
+	// 空串等价于 classic。仅影响主队列；派生队列恒为 classic。
+	QueueType QueueType
+
+	// maxPriority 是队列的 x-max-priority；prioritySet 标记用户是否显式设置过。
+	// 未设置时 classic 默认 10（保持历史行为），quorum/stream 始终不写。
+	maxPriority uint8
+	prioritySet bool
+
+	// deliveryLimit 是 quorum 队列的 x-delivery-limit，通过 WithDeliveryLimit 设置；<=0 不写。
+	deliveryLimit int
+
+	// delayedExchange 为 true 时延迟投递走 x-delayed-message 插件 exchange。
+	delayedExchange bool
+
+	// isolatePublisher 为 true 时发布与消费使用独立 connection。
+	isolatePublisher bool
+
 	// 日志与回调注入。
 	Logger        Logger
 	PubFailNotify func(FailedMsg)
@@ -138,14 +162,22 @@ type MQ struct {
 	// mode 用于事件标签，例如 "simple" / "direct" / "fanout" / "topic"。
 	mode string
 
-	// 连接互斥与状态。
+	// 连接互斥与状态。消费与（非隔离时的）发布共用 conn。
 	connMu sync.Mutex
 	conn   *amqp.Connection
+
+	// pubConn 是隔离模式（WithPublisherConnection）下发布专用的独立连接。
+	// 非隔离时为 nil，发布复用 conn。
+	pubConnMu sync.Mutex
+	pubConn   *amqp.Connection
 
 	// publish channel 与拓扑声明缓存（同一个 channel 内只声明一次）。
 	pubMu    sync.Mutex
 	pubCh    *amqp.Channel
 	pubDecls map[string]struct{}
+	// pubReturns 接收 broker 对 mandatory 不可路由消息的 basic.return。
+	// 生命周期与 pubCh 绑定，由 pubMu 保护；channel 重建时一并重置。
+	pubReturns chan amqp.Return
 
 	// 生命周期：destroyed 在 Destroy 中置位，publishWG 跟踪 in-flight publish。
 	lifeMu    sync.Mutex
@@ -256,6 +288,21 @@ type Observer interface {
 	OnReconnect(event ReconnectEvent)
 }
 
+// BlockedEvent 描述 broker 因内存 / 磁盘资源告警阻塞或恢复连接的事件。
+type BlockedEvent struct {
+	Mode    string
+	Blocked bool   // true = connection.blocked，false = connection.unblocked
+	Reason  string // broker 给出的阻塞原因；unblocked 时为空
+}
+
+// BlockObserver 是可选的连接阻塞观测接口。
+// 若通过 WithObserver 注入的实现同时实现了本接口，
+// broker 阻塞 / 恢复连接时库会回调 OnBlocked；否则该事件被忽略。
+// 这样设计可在不破坏既有 Observer 实现者的前提下新增阻塞观测能力。
+type BlockObserver interface {
+	OnBlocked(event BlockedEvent)
+}
+
 // newMQ 是内部构造函数。各模式构造完 MQOption 后调用此函数获得 *MQ。
 // 内部会派生 cancellable ctx 用于全局生命周期。
 func newMQ(option MQOption, mode string) (*MQ, error) {
@@ -275,6 +322,7 @@ func newMQ(option MQOption, mode string) (*MQ, error) {
 	}
 
 	mq.conn = conn
+	mq.watchBlocked(conn)
 
 	return mq, nil
 }
@@ -303,15 +351,22 @@ func (m *MQ) Destroy() {
 		// 4. 关闭 publish channel + 重置声明缓存。
 		m.closePublishChannel()
 
-		// 5. 关闭 connection。
+		// 5. 关闭 connection（共享连接 + 隔离模式下的发布连接）。
 		m.connMu.Lock()
 		conn := m.conn
 		m.conn = nil
 		m.connMu.Unlock()
 
-		if conn != nil {
-			if err := conn.Close(); err != nil && !errors.Is(err, amqp.ErrClosed) {
-				m.logger().Infof("close connection error: %v", err)
+		m.pubConnMu.Lock()
+		pubConn := m.pubConn
+		m.pubConn = nil
+		m.pubConnMu.Unlock()
+
+		for _, c := range []*amqp.Connection{conn, pubConn} {
+			if c != nil {
+				if err := c.Close(); err != nil && !errors.Is(err, amqp.ErrClosed) {
+					m.logger().Infof("close connection error: %v", err)
+				}
 			}
 		}
 	})
@@ -520,6 +575,28 @@ func (m *MQ) emitReconnect(event ReconnectEvent) {
 	m.opt.Observer.OnReconnect(event)
 }
 
+// emitBlocked 在 Observer 同时实现 BlockObserver 时投递一次连接阻塞 / 恢复事件，panic recover。
+func (m *MQ) emitBlocked(event BlockedEvent) {
+	if m == nil || m.opt.Observer == nil {
+		return
+	}
+
+	observer, ok := m.opt.Observer.(BlockObserver)
+	if !ok {
+		return
+	}
+
+	event.Mode = m.mode
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			m.logger().Errorf("BlockObserver.OnBlocked panic recovered: %v\n%s", rec, debug.Stack())
+		}
+	}()
+
+	observer.OnBlocked(event)
+}
+
 // declareStep 描述一次拓扑声明。cacheKey 用于 ensurePublishDeclared 去重。
 type declareStep struct {
 	cacheKey string
@@ -630,6 +707,11 @@ func (m *MQ) publishGeneric(req publishRequest) (msgID string, err error) {
 			}
 		}
 
+		// 清除上一次发布可能残留的退回（串行发布下通常为空，防御性处理）。
+		if req.mandatory {
+			m.drainReturns()
+		}
+
 		pub := req.buildPublishing(msgID)
 		confirmation, pubErr := ch.PublishWithDeferredConfirmWithContext(
 			ctx, req.exchange, req.routingKey, req.mandatory, req.immediate, pub,
@@ -638,7 +720,17 @@ func (m *MQ) publishGeneric(req publishRequest) (msgID string, err error) {
 			return pubErr
 		}
 
-		return waitForDeferredConfirm(ctx, confirmation)
+		if cErr := waitForDeferredConfirm(ctx, confirmation); cErr != nil {
+			return cErr
+		}
+
+		// broker 对不可路由的 mandatory 消息先 return 后 ack；
+		// ack 返回时 return 必已到达 pubReturns，可安全判定为发布失败。
+		if req.mandatory && len(m.drainReturns()) > 0 {
+			return ErrPublishReturned
+		}
+
+		return nil
 	})
 
 	m.emitPublish(PublishEvent{
@@ -687,6 +779,9 @@ func (m *MQ) batchPublishGeneric(exchange, routingKey string, bodies [][]byte) (
 	err := m.publishWithChannel(func(ch *amqp.Channel) error {
 		confs := make([]*amqp.DeferredConfirmation, len(bodies))
 
+		// 清除上一次发布可能残留的退回。
+		m.drainReturns()
+
 		for i, body := range bodies {
 			msgID := uuid.NewString()
 			msgIDs[i] = msgID
@@ -708,6 +803,9 @@ func (m *MQ) batchPublishGeneric(exchange, routingKey string, bodies [][]byte) (
 			confs[i] = conf
 		}
 
+		// returned 收集被 broker 退回（不可路由）的消息 ID；边等确认边排空，
+		// 避免 NotifyReturn 缓冲被打满阻塞 broker reader。
+		returned := make(map[string]struct{})
 		for i, conf := range confs {
 			if conf == nil {
 				continue
@@ -721,6 +819,25 @@ func (m *MQ) batchPublishGeneric(exchange, routingKey string, bodies [][]byte) (
 				m.notifyPubFailed(m.failedMessage(bodies[i], msgIDs[i]))
 				return fmt.Errorf("msg %q: %w", msgIDs[i], ErrPublishNotAcknowledged)
 			}
+			for _, r := range m.drainReturns() {
+				returned[r.MessageId] = struct{}{}
+			}
+		}
+		for _, r := range m.drainReturns() {
+			returned[r.MessageId] = struct{}{}
+		}
+
+		if len(returned) > 0 {
+			firstID := ""
+			for i, id := range msgIDs {
+				if _, ok := returned[id]; ok {
+					m.notifyPubFailed(m.failedMessage(bodies[i], id))
+					if firstID == "" {
+						firstID = id
+					}
+				}
+			}
+			return fmt.Errorf("msg %q: %w", firstID, ErrPublishReturned)
 		}
 		return nil
 	})

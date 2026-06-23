@@ -1,6 +1,6 @@
 # rabbit
 
-`rabbit` 是一个基于 `github.com/rabbitmq/amqp091-go` 的 RabbitMQ **企业级 Go 封装**，支持五种常见消息模型，覆盖从简单任务队列到多维度路由的全部场景。
+`rabbit` 是一个基于 `github.com/rabbitmq/amqp091-go` 的 RabbitMQ **企业级 Go 封装**，支持六种常见消息模型，覆盖从简单任务队列到多维度路由、消息流的全部场景，并兼容 RabbitMQ 3.x / 4.x。
 
 ### 为什么需要这个封装
 
@@ -15,18 +15,25 @@
 | **fanout** | `fanout` | 广播给所有绑定队列 | ❌ | 事件通知、缓存刷新 |
 | **topic** | `topic` | routing key 模式匹配（`*` / `#`） | ✅ | 按业务类型订阅 |
 | **headers** | `headers` | 消息 headers 属性匹配 | ✅ | 多维度路由、条件匹配 |
+| **stream** | 无（stream 队列） | 按 offset 顺序读取 | ❌（追加日志，不重试/requeue） | 大数据量、消息重放 |
+
+> 队列类型：simple/direct/fanout/topic/headers 默认使用 **classic** 队列，可通过 `WithQueueType(QueueTypeQuorum)` 切换为 **quorum** 队列以获得 RabbitMQ 4.x 下的高可用（需 broker 3.8+）。stream 模式固定使用 stream 队列（需 broker 3.9+）。
 
 项目最低需 `Go 1.22`（使用 `range over int`、`maps.Copy` 等现代特性）。
 
 ## 一、特性概览
 
-- 支持 `simple`、`direct`、`fanout`、`topic` 四种 RabbitMQ 模式
+- 支持 `simple`、`direct`、`fanout`、`topic`、`headers`、`stream` 六种 RabbitMQ 模式
+- 兼容 RabbitMQ 3.x / 4.x；支持 classic / quorum / stream 三种队列类型（`WithQueueType`）
+- 发布可靠性：mandatory 消息不可路由被退回时返回 `ErrPublishReturned` 并触发回调，杜绝静默丢失
 - 消费端支持自动重连（连接 + 通道双层重连，指数退避）
 - 发布端复用 confirm channel，避免每条消息都重新打开 channel
+- 可选发布/消费连接隔离（`WithPublisherConnection`），避免 TCP 背压互相影响
 - 发布时对 exchange / queue / retry queue / delay queue 做 channel 级声明缓存
-- 支持延迟消息，基于 `TTL + Dead Letter` 实现，不依赖 `x-delayed-message` 插件
-- 支持失败重试，使用消息头 `x-retry` 记录当前重试次数
+- 支持延迟消息：默认按 TTL 分桶到独立队列（无队头阻塞），也可启用 `x-delayed-message` 插件（`WithDelayedExchange`）
+- 支持失败重试，使用消息头 `x-retry` 记录当前重试次数；quorum 队列可用原生 `x-delivery-limit`（`WithDeliveryLimit`）
 - 支持死信消费
+- 可选连接阻塞观测（`BlockObserver`），感知 broker 内存/磁盘告警
 - 公共消费循环统一抽到 `runtime.go`，四种模式只声明拓扑差异
 - 消费者 `handler.Process` 在 `recover()` 保护下调用，panic 不会杀掉消费 goroutine
 - 全局 + 实例级 Logger 注入
@@ -197,6 +204,36 @@ type Observer interface {
 设置交换机声明时的单个额外参数，如 `alternate-exchange`（备份交换机）。
 可多次调用，每次追加或覆盖一个 key。
 
+### `WithQueueType(t QueueType)`
+
+设置主队列类型，默认 `QueueTypeClassic`。
+
+- `QueueTypeClassic`（默认）：经典队列，行为与历史版本完全一致，兼容 3.x / 4.x。
+- `QueueTypeQuorum`：quorum 队列，RabbitMQ 4.x 下的高可用方案（替代已移除的 classic 镜像队列），需 broker 3.8+。quorum 队列不支持 `x-max-priority`，库会自动跳过。
+- `QueueTypeStream`：stream 队列，见 stream 模式（一般通过 `NewStream` 使用）。
+
+仅影响主队列；retry / delay / dlq 等派生队列恒为 classic。
+
+> ⚠ **迁移提示**：对一个**已存在的同名 classic 队列**改用 quorum 会被 broker 以 `PRECONDITION_FAILED` 拒绝（队列类型不可原地变更），消费/发布会快速失败（`ErrPermanent`）。需先删除或更换队列名。
+
+### `WithPriority(maxPriority uint8)`
+
+设置队列的 `x-max-priority`。不调用时 classic 队列默认 `10`（与历史一致）；传 `0` 显式关闭优先级。quorum / stream 队列始终不写该参数。
+
+### `WithDeliveryLimit(limit int)`
+
+为 quorum 队列设置 `x-delivery-limit`，使用 quorum 原生的毒消息处理（投递达到上限后丢弃 / 进 DLX）。`<=0` 不设置；仅对 quorum 生效。
+
+### `WithDelayedExchange()`
+
+启用基于 `rabbitmq_delayed_message_exchange` 插件的延迟投递。启用后 `PublishDelay` 通过 `x-delayed-message` exchange 投递，单 exchange 即可承载混合 TTL、无队头阻塞，要求 broker 已安装该插件。不启用时（默认）延迟通过按 TTL 分桶的队列实现，不依赖任何插件。
+
+> simple 模式使用专用的 `<queue>.delayed` exchange；direct/topic/fanout/headers 模式则把业务 exchange 本身声明为 `x-delayed-message` 类型（底层按原类型路由）。
+
+### `WithPublisherConnection()`
+
+让发布与消费使用相互独立的 connection，避免 TCP 背压时消费端 ack 被发布端阻塞（RabbitMQ 官方最佳实践）。默认不启用，收发共用一条 connection 以保持兼容。
+
 ### 配置复用 `NewConfig`
 
 生产者和消费者若共用一组配置，可用 `NewConfig` 预构建：
@@ -359,6 +396,28 @@ mq, err := rabbit.NewPubSimple(
 | `PublishWithDlx(body []byte) (string, error)` | 声明 DLX 拓扑后发布 |
 | `PublishWithDlxString(msg string) (string, error)` | PublishWithDlx 的字符串便捷包装 |
 
+### Stream（消息流，broker 3.9+）
+
+stream 是追加式日志：消费端按 offset 读取、可重放，**不支持重试 / requeue**，消费失败的消息会被记录后跳过（ack 推进 offset）。
+
+| 方法 | 说明 |
+| --- | --- |
+| `NewStream(queueName, cfg) (*MQStream, error)` | 构造实例（强制 stream 队列类型） |
+| `NewPubStream(queueName, mqURL, opts...) (*MQStream, error)` | 构造发布端 |
+| `NewConsumeStream(queueName, mqURL, opts...) (*MQStream, error)` | 构造消费端 |
+| `Publish(body []byte) (string, error)` | 追加一条消息 |
+| `Consume(handler, offset StreamOffset) error` | 从 offset 起消费（`OffsetFirst` / `OffsetLast` / `OffsetNext`） |
+
+```go
+pub, _ := rabbit.NewPubStream("events.stream", mqURL)
+_, _ = pub.Publish([]byte("event-1"))
+
+cons, _ := rabbit.NewConsumeStream("events.stream", mqURL)
+go cons.Consume(handler, rabbit.OffsetFirst) // 从最早的消息开始重放
+```
+
+> stream 消费要求设置 prefetch（QoS），库默认 `1`；高吞吐场景用 `WithPrefetchCount` 调大。`PublishDelay` 对 stream 不支持。
+
 ### Retrier（simple / direct / topic 实现，fanout 不实现）
 
 | 方法 | 说明 |
@@ -371,6 +430,16 @@ mq, err := rabbit.NewPubSimple(
 | --- | --- |
 | `WithQueueArgs(args map[string]any)` | 设置队列声明时的额外参数（`x-message-ttl`、`x-max-length`、`x-single-active-consumer` 等） |
 | `WithExchangeArg(key string, value any)` | 设置交换机声明时的单个额外参数 |
+| `WithQueueType(t QueueType)` | 选择 classic（默认）/ quorum 队列类型 |
+| `WithPriority(maxPriority uint8)` | 设置 / 关闭队列优先级 |
+| `WithDeliveryLimit(limit int)` | quorum 队列的 `x-delivery-limit` |
+| `WithDelayedExchange()` | 启用 `x-delayed-message` 插件延迟投递 |
+| `WithPublisherConnection()` | 发布 / 消费连接隔离 |
+
+### 发布可靠性与连接观测
+
+- **`ErrPublishReturned`**：以 mandatory 发布的消息无法路由到任何队列时，`Publish` / `BatchPublish` 返回该错误（`errors.Is` 判定）并触发 `PubFailNotify`。注意 fanout 广播在无任何绑定队列时也会触发。
+- **`BlockObserver`（可选接口）**：若传入 `WithObserver` 的实现额外实现了 `OnBlocked(BlockedEvent)`，broker 因内存/磁盘告警阻塞或恢复连接时会回调；不实现则忽略，不破坏既有 `Observer`。
 
 ## 八、完整示例
 

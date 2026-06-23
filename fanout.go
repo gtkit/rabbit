@@ -2,7 +2,7 @@ package rabbit
 
 import (
 	"errors"
-	"maps"
+	"fmt"
 	"strings"
 	"time"
 
@@ -118,24 +118,32 @@ func (f *MQFanout) Consume(handler MsgHandler) error {
 }
 
 // PublishDelay 发布一条延迟广播消息，返回 messageID。
+//
+// 默认按 TTL 分桶到独立 delay 队列（队列名含 TTL），不同 TTL 互不阻塞；
+// 启用 WithDelayedExchange 时改走 x-delayed-message 插件 exchange。
 func (f *MQFanout) PublishDelay(body []byte, ttl time.Duration) (string, error) {
-	delayQueue := f.baseName() + ".delay"
+	ms := delayMillis(ttl)
+
+	if f.opt.delayedExchange {
+		return f.publishWithDelayHeader(f.opt.ExchangeName, "", body, ms, f.declareExchange)
+	}
+
+	delayQueue := fmt.Sprintf("%s.delay.%d", f.baseName(), ms)
 	return f.publishGeneric(publishRequest{
 		operation:  "publish delay",
 		body:       body,
 		routingKey: delayQueue,
 		mandatory:  true,
-		expiration: ttlToString(ttl),
 		headers:    amqp.Table{"x-retry": int32(0)},
 		declares: []declareStep{
 			{cacheKey: "exchange", declare: f.declareExchange},
 			{cacheKey: "delay:" + delayQueue, declare: func(ch *amqp.Channel) error {
 				_, err := ch.QueueDeclare(
 					delayQueue, true, false, false, false,
-					amqp.Table{
+					f.derivedQueueArgs(amqp.Table{
+						"x-message-ttl":          ms,
 						"x-dead-letter-exchange": f.opt.ExchangeName,
-						"x-max-priority":         simpleQueueMaxPriority,
-					},
+					}),
 				)
 				return err
 			}},
@@ -202,7 +210,12 @@ func (f *MQFanout) ConsumeDlx(handler MsgHandler) error {
 }
 
 // declareExchange 声明 fanout 类型的业务 exchange。
+// 启用 WithDelayedExchange 时声明为 x-delayed-message 类型（底层 fanout）。
 func (f *MQFanout) declareExchange(ch *amqp.Channel) error {
+	if f.opt.delayedExchange {
+		return declareExchangeWithArgs(ch, f.opt.ExchangeName, delayedMessageExchangeType,
+			delayedExchangeArgs(f.opt.ExchangeArgs, amqp.ExchangeFanout))
+	}
 	return declareExchangeWithArgs(ch, f.opt.ExchangeName, amqp.ExchangeFanout, f.opt.ExchangeArgs)
 }
 
@@ -213,14 +226,7 @@ func (f *MQFanout) declareBoundQueue(ch *amqp.Channel, args amqp.Table) (amqp.Qu
 		return amqp.Queue{}, err
 	}
 
-	queueArgs := make(amqp.Table)
-	if f.opt.QueueArgs != nil {
-		maps.Copy(queueArgs, f.opt.QueueArgs)
-	}
-	queueArgs["x-max-priority"] = simpleQueueMaxPriority
-	maps.Copy(queueArgs, args)
-
-	queue, err := ch.QueueDeclare(f.opt.QueueName, true, false, false, false, queueArgs)
+	queue, err := ch.QueueDeclare(f.opt.QueueName, true, false, false, false, f.mainQueueArgs(args))
 	if err != nil {
 		return amqp.Queue{}, err
 	}

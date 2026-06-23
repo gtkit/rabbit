@@ -2,7 +2,7 @@ package rabbit
 
 import (
 	"errors"
-	"maps"
+	"fmt"
 	"strings"
 	"time"
 
@@ -69,6 +69,7 @@ func (r *routedMQ) Publish(body []byte) (string, error) {
 		body:       body,
 		exchange:   r.opt.ExchangeName,
 		routingKey: r.opt.RoutingKey,
+		mandatory:  true,
 		headers:    amqp.Table{"x-retry": int32(0)},
 		declares: []declareStep{
 			{cacheKey: "exchange", declare: r.declareExchange},
@@ -153,25 +154,33 @@ func (r *routedMQ) RetryMsg(msg amqp.Delivery, ttl time.Duration) error {
 }
 
 // PublishDelay 发布一条延迟消息（毫秒精度），返回 messageID。
+//
+// 默认按 TTL 分桶到独立 delay 队列（队列名含 TTL），不同 TTL 互不阻塞；
+// 启用 WithDelayedExchange 时改走 x-delayed-message 插件 exchange。
 func (r *routedMQ) PublishDelay(body []byte, ttl time.Duration) (string, error) {
-	delayQueue := r.baseName() + ".delay"
+	ms := delayMillis(ttl)
+
+	if r.opt.delayedExchange {
+		return r.publishWithDelayHeader(r.opt.ExchangeName, r.opt.RoutingKey, body, ms, r.declareExchange)
+	}
+
+	delayQueue := fmt.Sprintf("%s.delay.%d", r.baseName(), ms)
 	return r.publishGeneric(publishRequest{
 		operation:  "publish delay",
 		body:       body,
 		routingKey: delayQueue,
 		mandatory:  true,
-		expiration: ttlToString(ttl),
 		headers:    amqp.Table{"x-retry": int32(0)},
 		declares: []declareStep{
 			{cacheKey: "exchange", declare: r.declareExchange},
 			{cacheKey: "delay:" + delayQueue, declare: func(ch *amqp.Channel) error {
 				_, err := ch.QueueDeclare(
 					delayQueue, true, false, false, false,
-					amqp.Table{
+					r.derivedQueueArgs(amqp.Table{
+						"x-message-ttl":             ms,
 						"x-dead-letter-exchange":    r.opt.ExchangeName,
 						"x-dead-letter-routing-key": r.opt.RoutingKey,
-						"x-max-priority":            simpleQueueMaxPriority,
-					},
+					}),
 				)
 				return err
 			}},
@@ -213,8 +222,14 @@ func (r *routedMQ) ConsumeDlx(handler MsgHandler) error {
 	})
 }
 
-// declareExchange 按 exchangeKind 声明业务 exchange。
+// declareExchange 声明业务 exchange。
+// 启用 WithDelayedExchange 时，业务 exchange 声明为 x-delayed-message 类型
+// （底层仍按 exchangeKind 路由），从而 PublishDelay 可通过 x-delay header 实现延迟。
 func (r *routedMQ) declareExchange(ch *amqp.Channel) error {
+	if r.opt.delayedExchange {
+		return declareExchangeWithArgs(ch, r.opt.ExchangeName, delayedMessageExchangeType,
+			delayedExchangeArgs(r.opt.ExchangeArgs, r.exchangeKind))
+	}
 	return declareExchangeWithArgs(ch, r.opt.ExchangeName, r.exchangeKind, r.opt.ExchangeArgs)
 }
 
@@ -225,14 +240,7 @@ func (r *routedMQ) declareBoundQueue(ch *amqp.Channel, args amqp.Table) (amqp.Qu
 		return amqp.Queue{}, err
 	}
 
-	queueArgs := make(amqp.Table)
-	if r.opt.QueueArgs != nil {
-		maps.Copy(queueArgs, r.opt.QueueArgs)
-	}
-	queueArgs["x-max-priority"] = simpleQueueMaxPriority
-	maps.Copy(queueArgs, args)
-
-	queue, err := ch.QueueDeclare(r.opt.QueueName, true, false, false, false, queueArgs)
+	queue, err := ch.QueueDeclare(r.opt.QueueName, true, false, false, false, r.mainQueueArgs(args))
 	if err != nil {
 		return amqp.Queue{}, err
 	}
@@ -299,11 +307,10 @@ func (r *routedMQ) publishRetryMessage(msg amqp.Delivery, headers amqp.Table, tt
 			{cacheKey: "retry:" + retryQueue, declare: func(ch *amqp.Channel) error {
 				_, err := ch.QueueDeclare(
 					retryQueue, true, false, false, false,
-					amqp.Table{
+					r.derivedQueueArgs(amqp.Table{
 						"x-dead-letter-exchange":    r.opt.ExchangeName,
 						"x-dead-letter-routing-key": r.opt.RoutingKey,
-						"x-max-priority":            simpleQueueMaxPriority,
-					},
+					}),
 				)
 				return err
 			}},

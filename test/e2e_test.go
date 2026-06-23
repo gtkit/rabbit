@@ -406,7 +406,7 @@ func TestE2ESimpleDelay(t *testing.T) {
 	queue := uniqueName(t, "q-simple-delay")
 	t.Cleanup(func() {
 		deleteQueue(t, queue)
-		deleteQueue(t, queue+"-delay")
+		deleteQueue(t, queue+"-delay-800")
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -784,7 +784,7 @@ func TestE2EDirectDelay(t *testing.T) {
 	queue := uniqueName(t, "q-direct-delay")
 	t.Cleanup(func() {
 		deleteQueue(t, queue)
-		deleteQueue(t, queue+".delay")
+		deleteQueue(t, queue+".delay.800")
 		deleteExchange(t, exchange)
 	})
 
@@ -947,7 +947,7 @@ func TestE2ETopicDelay(t *testing.T) {
 	queue := uniqueName(t, "q-topic-delay")
 	t.Cleanup(func() {
 		deleteQueue(t, queue)
-		deleteQueue(t, queue+".delay")
+		deleteQueue(t, queue+".delay.800")
 		deleteExchange(t, exchange)
 	})
 

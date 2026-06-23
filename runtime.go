@@ -18,6 +18,9 @@ const (
 	maxBackoffDelay = 30 * time.Second
 	// idleAfterClose 是 channel 关闭后等待重连的间隔。
 	idleAfterClose = 1 * time.Second
+	// returnNotifyBuffer 是 publish channel 上 NotifyReturn 通道的缓冲大小。
+	// 发布在 pubMu 下串行，且每次发布后立即排空，缓冲只需吸收瞬时退回，取小值即可。
+	returnNotifyBuffer = 16
 )
 
 // nameSanitizer 把 AMQP 路由 / 队列名里不友好的字符替换掉，
@@ -39,6 +42,15 @@ func ttlToString(d time.Duration) string {
 	}
 
 	return strconv.FormatInt(d.Milliseconds(), 10)
+}
+
+// delayMillis 把延迟时长转换为毫秒整数（用于 x-message-ttl / x-delay）。
+// 非正值返回 0，表示立即投递。
+func delayMillis(d time.Duration) int {
+	if d <= 0 {
+		return 0
+	}
+	return int(d.Milliseconds())
 }
 
 // clampInt32 把任意 int64 收敛到 int32 范围。
@@ -113,6 +125,76 @@ func (m *MQ) dial() (*amqp.Connection, error) {
 	return amqp.DialConfig(m.opt.MQURL, config)
 }
 
+// watchBlocked 在配置了 BlockObserver 时，注册 conn 的 NotifyBlocked，
+// 并启动 goroutine 把 broker 的阻塞 / 恢复事件投递给 Observer。
+// goroutine 随连接关闭（NotifyBlocked 通道关闭）自动退出，不会泄漏。
+func (m *MQ) watchBlocked(conn *amqp.Connection) {
+	if conn == nil || m.opt.Observer == nil {
+		return
+	}
+	if _, ok := m.opt.Observer.(BlockObserver); !ok {
+		return
+	}
+
+	blockings := conn.NotifyBlocked(make(chan amqp.Blocking, 1))
+	go func() {
+		for b := range blockings {
+			m.emitBlocked(BlockedEvent{Blocked: b.Active, Reason: b.Reason})
+		}
+	}()
+}
+
+// publisherConn 返回发布所用连接：隔离模式（WithPublisherConnection）下使用独立
+// pubConn，否则复用共享 conn。返回前确保连接已建立。
+func (m *MQ) publisherConn() (*amqp.Connection, error) {
+	if !m.opt.isolatePublisher {
+		if err := m.reconnect(); err != nil {
+			return nil, err
+		}
+		return m.getConn(), nil
+	}
+	return m.reconnectPublisher()
+}
+
+// reconnectPublisher 在隔离模式下按需建立 / 重建发布专用连接。
+func (m *MQ) reconnectPublisher() (*amqp.Connection, error) {
+	if m == nil {
+		return nil, ErrNotInitialized
+	}
+
+	m.pubConnMu.Lock()
+	defer m.pubConnMu.Unlock()
+
+	if m.pubConn != nil && !m.pubConn.IsClosed() {
+		return m.pubConn, nil
+	}
+
+	conn, err := m.dial()
+	if err != nil {
+		return nil, err
+	}
+
+	stale := m.pubConn
+	m.pubConn = conn
+
+	// 旧连接上的 publish channel 失效，清理待重建。
+	m.pubMu.Lock()
+	if m.pubCh != nil {
+		_ = m.pubCh.Close()
+		m.pubCh = nil
+	}
+	m.pubDecls = nil
+	m.pubReturns = nil
+	m.pubMu.Unlock()
+
+	if stale != nil && !stale.IsClosed() {
+		_ = stale.Close()
+	}
+
+	m.watchBlocked(conn)
+	return conn, nil
+}
+
 // reconnect 在 connection 已断开时重新拨号。
 // 同时把旧的 publish channel 和声明缓存清掉，让下一次 publishWithChannel 重新初始化。
 func (m *MQ) reconnect() error {
@@ -134,18 +216,25 @@ func (m *MQ) reconnect() error {
 
 	staleConn := m.conn
 	m.conn = conn
-	m.pubMu.Lock()
-	if m.pubCh != nil {
-		_ = m.pubCh.Close()
-		m.pubCh = nil
+
+	// 非隔离模式下 publish channel 建在共享连接上，重连需一并清理重建；
+	// 隔离模式下 publish channel 属于 pubConn，由 reconnectPublisher 负责，不在此处动。
+	if !m.opt.isolatePublisher {
+		m.pubMu.Lock()
+		if m.pubCh != nil {
+			_ = m.pubCh.Close()
+			m.pubCh = nil
+		}
+		m.pubDecls = nil
+		m.pubReturns = nil
+		m.pubMu.Unlock()
 	}
-	m.pubDecls = nil
-	m.pubMu.Unlock()
 
 	if staleConn != nil && !staleConn.IsClosed() {
 		_ = staleConn.Close()
 	}
 
+	m.watchBlocked(conn)
 	return nil
 }
 
@@ -192,12 +281,35 @@ func (m *MQ) closePublishChannel() {
 
 	if m.pubCh == nil {
 		m.pubDecls = nil
+		m.pubReturns = nil
 		return
 	}
 
 	_ = m.pubCh.Close()
 	m.pubCh = nil
 	m.pubDecls = nil
+	m.pubReturns = nil
+}
+
+// drainReturns 非阻塞地排空 pubReturns 中已到达的退回消息。
+// 调用方必须持有 pubMu。返回本次排空到的所有 basic.return。
+func (m *MQ) drainReturns() []amqp.Return {
+	if m.pubReturns == nil {
+		return nil
+	}
+
+	var out []amqp.Return
+	for {
+		select {
+		case r, ok := <-m.pubReturns:
+			if !ok {
+				return out
+			}
+			out = append(out, r)
+		default:
+			return out
+		}
+	}
 }
 
 // closeAMQPChannel 是 nil 安全的 channel.Close 包装。
@@ -277,11 +389,10 @@ func safeNamePart(value string) string {
 // publishWithChannel 在 pubMu 保护下复用 confirm channel 执行一次 publish。
 // channel 不可用时会自动重建。
 func (m *MQ) publishWithChannel(fn func(*amqp.Channel) error) error {
-	if err := m.reconnect(); err != nil {
+	conn, err := m.publisherConn()
+	if err != nil {
 		return err
 	}
-
-	conn := m.getConn()
 	if conn == nil {
 		return ErrConnectionNotInitialized
 	}
@@ -302,12 +413,14 @@ func (m *MQ) publishWithChannel(fn func(*amqp.Channel) error) error {
 
 		m.pubCh = ch
 		m.pubDecls = make(map[string]struct{})
+		m.pubReturns = ch.NotifyReturn(make(chan amqp.Return, returnNotifyBuffer))
 	}
 
 	if err := fn(m.pubCh); err != nil {
 		if m.pubCh != nil && m.pubCh.IsClosed() {
 			m.pubCh = nil
 			m.pubDecls = nil
+			m.pubReturns = nil
 		}
 		return err
 	}
@@ -592,6 +705,8 @@ type consumerConfig struct {
 	declare func(ch *amqp.Channel) (amqp.Queue, error)
 	// onDelivery 处理单条消息。
 	onDelivery func(msg amqp.Delivery, handler MsgHandler) error
+	// consumeArgs 是 basic.consume 的额外参数（如 stream 的 x-stream-offset）；nil 表示无。
+	consumeArgs amqp.Table
 }
 
 // runConsumer 是公共消费循环：连接 / 通道 / 声明 / 消费 / 重连。
@@ -690,7 +805,7 @@ func (m *MQ) consumeLoop(
 	handler MsgHandler,
 	cfg consumerConfig,
 ) error {
-	deliveries, err := ch.Consume(queue.Name, "", false, false, false, false, nil)
+	deliveries, err := ch.Consume(queue.Name, "", false, false, false, false, cfg.consumeArgs)
 	if err != nil {
 		closeAMQPChannel(ch)
 		m.logger().Infof("%s start consume failed: %v, will reconnect", cfg.logTag, err)

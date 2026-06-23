@@ -2,7 +2,7 @@ package rabbit
 
 import (
 	"errors"
-	"maps"
+	"fmt"
 	"strings"
 	"time"
 
@@ -166,14 +166,29 @@ func (s *MQSimple) RetryMsg(msg amqp.Delivery, ttl time.Duration) error {
 }
 
 // PublishDelay 发布一条延迟消息（毫秒精度），返回 messageID。
+//
+// 默认实现按 TTL 分桶到独立 delay 队列（队列名含 TTL），不同 TTL 互不阻塞；
+// 启用 WithDelayedExchange 时改走 x-delayed-message 插件 exchange。
 func (s *MQSimple) PublishDelay(body []byte, ttl time.Duration) (string, error) {
-	delayQueue := s.opt.QueueName + "-delay"
+	ms := delayMillis(ttl)
+
+	if s.opt.delayedExchange {
+		delayedEx := s.opt.QueueName + ".delayed"
+		return s.publishDelayedExchange(body, ms, delayedEx, amqp.ExchangeDirect, s.opt.QueueName,
+			func(ch *amqp.Channel) error {
+				if _, err := s.declareQueue(ch, nil); err != nil {
+					return err
+				}
+				return ch.QueueBind(s.opt.QueueName, s.opt.QueueName, delayedEx, false, nil)
+			})
+	}
+
+	delayQueue := fmt.Sprintf("%s-delay-%d", s.opt.QueueName, ms)
 	return s.publishGeneric(publishRequest{
 		operation:  "publish delay",
 		body:       body,
 		routingKey: delayQueue,
 		mandatory:  true,
-		expiration: ttlToString(ttl),
 		headers:    amqp.Table{"x-retry": int32(0)},
 		declares: []declareStep{
 			{cacheKey: "queue", declare: func(ch *amqp.Channel) error {
@@ -183,11 +198,11 @@ func (s *MQSimple) PublishDelay(body []byte, ttl time.Duration) (string, error) 
 			{cacheKey: "delay:" + delayQueue, declare: func(ch *amqp.Channel) error {
 				_, err := ch.QueueDeclare(
 					delayQueue, true, false, false, false,
-					amqp.Table{
+					s.derivedQueueArgs(amqp.Table{
+						"x-message-ttl":             ms,
 						"x-dead-letter-exchange":    "",
 						"x-dead-letter-routing-key": s.opt.QueueName,
-						"x-max-priority":            simpleQueueMaxPriority,
-					},
+					}),
 				)
 				return err
 			}},
@@ -249,14 +264,7 @@ func (s *MQSimple) ConsumeDlx(handler MsgHandler) error {
 // declareQueue 在 ch 上声明 simple 主队列（按 simpleQueueMaxPriority 设置优先级）。
 // args 用于追加业务自定义 queue arguments（例如 x-dead-letter-exchange）。
 func (s *MQSimple) declareQueue(ch *amqp.Channel, args amqp.Table) (amqp.Queue, error) {
-	queueArgs := make(amqp.Table)
-	if s.opt.QueueArgs != nil {
-		maps.Copy(queueArgs, s.opt.QueueArgs)
-	}
-	queueArgs["x-max-priority"] = simpleQueueMaxPriority
-	maps.Copy(queueArgs, args)
-
-	return ch.QueueDeclare(s.opt.QueueName, true, false, false, false, queueArgs)
+	return ch.QueueDeclare(s.opt.QueueName, true, false, false, false, s.mainQueueArgs(args))
 }
 
 // declareDLXTopology 声明 simple 模式的死信拓扑：
@@ -312,11 +320,10 @@ func (s *MQSimple) publishRetryMessage(msg amqp.Delivery, headers amqp.Table, tt
 			{cacheKey: "retry:" + retryQueue, declare: func(ch *amqp.Channel) error {
 				_, err := ch.QueueDeclare(
 					retryQueue, true, false, false, false,
-					amqp.Table{
+					s.derivedQueueArgs(amqp.Table{
 						"x-dead-letter-exchange":    "",
 						"x-dead-letter-routing-key": s.opt.QueueName,
-						"x-max-priority":            simpleQueueMaxPriority,
-					},
+					}),
 				)
 				return err
 			}},
