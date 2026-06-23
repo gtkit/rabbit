@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -187,9 +188,15 @@ func WithDeliveryMode(mode uint8) Option {
 	}
 }
 
-// WithQueueArgs 设置队列声明时的额外参数，如 x-message-ttl、x-max-length 等。
-// 已设置的默认参数（如 x-max-priority）不会被覆盖。
-// 零值字段（0、空串）不会被写入，避免与 broker 默认行为冲突。
+// WithQueueArgs 设置主队列声明时的额外参数，如 x-message-ttl、x-max-length 等。
+//
+// 合并规则（见 mainQueueArgs）：先原样并入这里设置的全部键值（包括零值，
+// 不做过滤），随后库按所选 QueueType 写入保留键——classic 写 x-max-priority、
+// quorum 写 x-queue-type 与可选 x-delivery-limit、stream 写 x-queue-type；
+// 对这些保留键，库的值优先于此处同名键。其余键原样传给 broker。
+//
+// 因此：请勿通过本选项设置 x-queue-type（用 WithQueueType）或 x-max-priority
+// （用 WithPriority）；retry/delay/dlq 等派生队列不使用这里的参数。
 func WithQueueArgs(args map[string]any) Option {
 	return func(option *MQOption) {
 		if option.QueueArgs == nil {
@@ -289,6 +296,12 @@ func normalizeOption(option MQOption) (MQOption, error) {
 
 	if option.QueueType == "" {
 		option.QueueType = QueueTypeClassic
+	}
+	switch option.QueueType {
+	case QueueTypeClassic, QueueTypeQuorum, QueueTypeStream:
+	default:
+		return MQOption{}, fmt.Errorf("mq: invalid queue type %q (must be one of %q/%q/%q)",
+			option.QueueType, QueueTypeClassic, QueueTypeQuorum, QueueTypeStream)
 	}
 
 	// 优先级默认值：用户未显式设置时回退到历史默认 10。

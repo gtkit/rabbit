@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -286,11 +285,7 @@ func (h *MQHeaders) ConsumeDlx(handler MsgHandler) error {
 // declareExchange 声明 headers 类型的业务 exchange。
 // 启用 WithDelayedExchange 时声明为 x-delayed-message 类型（底层 headers）。
 func (h *MQHeaders) declareExchange(ch *amqp.Channel) error {
-	if h.opt.delayedExchange {
-		return declareExchangeWithArgs(ch, h.opt.ExchangeName, delayedMessageExchangeType,
-			delayedExchangeArgs(h.opt.ExchangeArgs, amqp.ExchangeHeaders))
-	}
-	return declareExchangeWithArgs(ch, h.opt.ExchangeName, amqp.ExchangeHeaders, h.opt.ExchangeArgs)
+	return declareBusinessExchange(ch, h.opt.ExchangeName, amqp.ExchangeHeaders, h.opt.ExchangeArgs, h.opt.delayedExchange)
 }
 
 // declareBoundQueue 声明主队列并把它绑定到业务 exchange。
@@ -317,54 +312,29 @@ func (h *MQHeaders) declareBoundQueue(ch *amqp.Channel, args amqp.Table) (amqp.Q
 // <exchange>.dlx exchange（与主 exchange 同类型）+ <base>.dlq 死信队列。
 func (h *MQHeaders) declareDLXTopology(ch *amqp.Channel) (amqp.Queue, string, error) {
 	dlxExchange := h.opt.ExchangeName + ".dlx"
-
-	if err := ch.ExchangeDeclare(dlxExchange, amqp.ExchangeHeaders, true, false, false, false, nil); err != nil {
-		return amqp.Queue{}, "", err
-	}
-
-	queue, err := h.declareBoundQueue(ch, amqp.Table{
-		"x-dead-letter-exchange": dlxExchange,
+	return h.declareDLX(ch, dlxSpec{
+		dlxExchange: dlxExchange,
+		dlxKind:     amqp.ExchangeHeaders,
+		dlqName:     h.baseName() + ".dlq",
+		dlqBindKey:  "",
+		declareMain: func(ch *amqp.Channel) (amqp.Queue, error) {
+			return h.declareBoundQueue(ch, amqp.Table{"x-dead-letter-exchange": dlxExchange})
+		},
 	})
-	if err != nil {
-		return amqp.Queue{}, "", err
-	}
-
-	dlqName := h.baseName() + ".dlq"
-	if _, declareErr := ch.QueueDeclare(dlqName, true, false, false, false, nil); declareErr != nil {
-		return amqp.Queue{}, "", declareErr
-	}
-
-	if bindErr := ch.QueueBind(dlqName, "", dlxExchange, false, nil); bindErr != nil {
-		return amqp.Queue{}, "", bindErr
-	}
-
-	return queue, dlqName, nil
 }
 
 // publishRetryMessage 把当前 delivery 投递到 retry queue（带 TTL）。
 func (h *MQHeaders) publishRetryMessage(msg amqp.Delivery, headers amqp.Table, ttl time.Duration) error {
 	retryQueue := h.baseName() + ".retry"
-	messageID := msg.MessageId
-	if messageID == "" {
-		messageID = uuid.NewString()
-	}
 
 	// 保留原始 headers 用于路由，追加 x-retry
 	routingHeaders := copyHeaders(msg.Headers)
 	maps.Copy(routingHeaders, headers)
 
-	_, err := h.publishGeneric(publishRequest{
-		operation:   "publish retry",
-		body:        msg.Body,
-		msgID:       messageID,
-		exchange:    h.opt.ExchangeName,
-		routingKey:  retryQueue,
-		mandatory:   true,
-		contentType: msg.ContentType,
-		headers:     routingHeaders,
-		expiration:  ttlToString(ttl),
-		priority:    msg.Priority,
-		timestamp:   time.Now(),
+	return h.publishRetry(msg, retrySpec{
+		retryQueue: retryQueue,
+		exchange:   h.opt.ExchangeName,
+		headers:    routingHeaders,
 		declares: []declareStep{
 			{cacheKey: "exchange", declare: h.declareExchange},
 			{cacheKey: "retry:" + retryQueue, declare: func(ch *amqp.Channel) error {
@@ -377,14 +347,10 @@ func (h *MQHeaders) publishRetryMessage(msg amqp.Delivery, headers amqp.Table, t
 				return err
 			}},
 		},
-	})
-	return err
+	}, ttl)
 }
 
 // baseName 派生 retry / delay / dlq 队列的命名前缀。
 func (h *MQHeaders) baseName() string {
-	if strings.TrimSpace(h.opt.QueueName) != "" {
-		return safeNamePart(h.opt.QueueName)
-	}
-	return safeNamePart(h.opt.ExchangeName)
+	return deriveBaseName(h.opt.QueueName, h.opt.ExchangeName, "")
 }

@@ -19,7 +19,7 @@
 
 > 队列类型：simple/direct/fanout/topic/headers 默认使用 **classic** 队列，可通过 `WithQueueType(QueueTypeQuorum)` 切换为 **quorum** 队列以获得 RabbitMQ 4.x 下的高可用（需 broker 3.8+）。stream 模式固定使用 stream 队列（需 broker 3.9+）。
 
-项目最低需 `Go 1.22`（使用 `range over int`、`maps.Copy` 等现代特性）。
+项目需 `Go 1.26`（`go.mod` 声明 `go 1.26`，使用 `range over int`、`maps.Copy` 等现代特性）。
 
 ### 版本兼容性
 

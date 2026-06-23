@@ -107,3 +107,36 @@ func TestNewOptionAppliesFunctionalOptions(t *testing.T) {
 		t.Fatalf("newOption() retryTTL = %v, want %v", opt.RetryTTL, 3500*time.Millisecond)
 	}
 }
+
+func TestNormalizeOptionQueueTypeValidation(t *testing.T) {
+	t.Parallel()
+
+	const url = "amqp://guest:guest@localhost:5672/"
+
+	// 合法值（含空串→classic）全部通过。
+	valid := []struct {
+		in   QueueType
+		want QueueType
+	}{
+		{"", QueueTypeClassic},
+		{QueueTypeClassic, QueueTypeClassic},
+		{QueueTypeQuorum, QueueTypeQuorum},
+		{QueueTypeStream, QueueTypeStream},
+	}
+	for _, c := range valid {
+		opt, err := newOption(url, WithQueueName("jobs"), WithQueueType(c.in))
+		if err != nil {
+			t.Fatalf("WithQueueType(%q) unexpected error: %v", c.in, err)
+		}
+		if opt.QueueType != c.want {
+			t.Fatalf("WithQueueType(%q) normalized to %q, want %q", c.in, opt.QueueType, c.want)
+		}
+	}
+
+	// 非法值直接报错，不静默退回 classic。
+	for _, bad := range []QueueType{"qurom", "Quorum", "classic ", "lazy"} {
+		if _, err := newOption(url, WithQueueName("jobs"), WithQueueType(bad)); err == nil {
+			t.Fatalf("WithQueueType(%q) should return error, got nil", bad)
+		}
+	}
+}

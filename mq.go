@@ -748,6 +748,39 @@ func (m *MQ) publishGeneric(req publishRequest) (msgID string, err error) {
 	return msgID, nil
 }
 
+// retrySpec 描述各模式把消息投递到 retry queue 的差异部分。
+type retrySpec struct {
+	retryQueue string     // retry 队列名（同时作为发布 routingKey）
+	exchange   string     // 发布目标 exchange（"" = 默认 exchange）
+	headers    amqp.Table // 投递携带的 headers
+	declares   []declareStep
+}
+
+// publishRetry 是 simple/routed/headers 把当前 delivery 投到 retry queue 的公共骨架。
+// 统一 messageID 兜底与 publishGeneric 字段拼装；各模式只提供 retrySpec 差异。
+func (m *MQ) publishRetry(msg amqp.Delivery, spec retrySpec, ttl time.Duration) error {
+	messageID := msg.MessageId
+	if messageID == "" {
+		messageID = uuid.NewString()
+	}
+
+	_, err := m.publishGeneric(publishRequest{
+		operation:   "publish retry",
+		body:        msg.Body,
+		msgID:       messageID,
+		exchange:    spec.exchange,
+		routingKey:  spec.retryQueue,
+		mandatory:   true,
+		contentType: msg.ContentType,
+		headers:     spec.headers,
+		expiration:  ttlToString(ttl),
+		priority:    msg.Priority,
+		timestamp:   time.Now(),
+		declares:    spec.declares,
+	})
+	return err
+}
+
 // batchPublishGeneric 是所有 BatchPublish 的公共实现。
 // 在一个 channel 上快速发送多条消息，然后一次性等待所有确认。
 func (m *MQ) batchPublishGeneric(exchange, routingKey string, bodies [][]byte) ([]string, error) {

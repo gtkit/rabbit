@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -272,50 +271,24 @@ func (s *MQSimple) declareQueue(ch *amqp.Channel, args amqp.Table) (amqp.Queue, 
 // 同时把主队列的 x-dead-letter-exchange 指向 dlx，使被 reject 的消息进入 DLQ。
 func (s *MQSimple) declareDLXTopology(ch *amqp.Channel) (amqp.Queue, string, error) {
 	dlxName := "dlx-" + s.opt.QueueName
-	dlqName := "dlq-" + s.opt.QueueName
-
-	if err := ch.ExchangeDeclare(dlxName, amqp.ExchangeFanout, true, false, false, false, nil); err != nil {
-		return amqp.Queue{}, "", err
-	}
-
-	queue, err := s.declareQueue(ch, amqp.Table{
-		"x-dead-letter-exchange": dlxName,
+	return s.declareDLX(ch, dlxSpec{
+		dlxExchange: dlxName,
+		dlxKind:     amqp.ExchangeFanout,
+		dlqName:     "dlq-" + s.opt.QueueName,
+		dlqBindKey:  "#",
+		declareMain: func(ch *amqp.Channel) (amqp.Queue, error) {
+			return s.declareQueue(ch, amqp.Table{"x-dead-letter-exchange": dlxName})
+		},
 	})
-	if err != nil {
-		return amqp.Queue{}, "", err
-	}
-
-	if _, declareErr := ch.QueueDeclare(dlqName, true, false, false, false, nil); declareErr != nil {
-		return amqp.Queue{}, "", declareErr
-	}
-
-	if bindErr := ch.QueueBind(dlqName, "#", dlxName, false, nil); bindErr != nil {
-		return amqp.Queue{}, "", bindErr
-	}
-
-	return queue, dlqName, nil
 }
 
 // publishRetryMessage 把当前 delivery 投递到 retry queue（带 TTL）。
 // retry queue 的 dead-letter 目标是主队列，TTL 到期后消息自动回到主队列被再次消费。
 func (s *MQSimple) publishRetryMessage(msg amqp.Delivery, headers amqp.Table, ttl time.Duration) error {
 	retryQueue := s.opt.QueueName + "-retry"
-	messageID := msg.MessageId
-	if messageID == "" {
-		messageID = uuid.NewString()
-	}
-
-	_, err := s.publishGeneric(publishRequest{
-		operation:   "publish retry",
-		body:        msg.Body,
-		msgID:       messageID,
-		routingKey:  retryQueue,
-		mandatory:   true,
-		contentType: msg.ContentType,
-		headers:     headers,
-		expiration:  ttlToString(ttl),
-		priority:    msg.Priority,
-		timestamp:   time.Now(),
+	return s.publishRetry(msg, retrySpec{
+		retryQueue: retryQueue,
+		headers:    headers,
 		declares: []declareStep{
 			{cacheKey: "retry:" + retryQueue, declare: func(ch *amqp.Channel) error {
 				_, err := ch.QueueDeclare(
@@ -328,6 +301,5 @@ func (s *MQSimple) publishRetryMessage(msg amqp.Delivery, headers amqp.Table, tt
 				return err
 			}},
 		},
-	})
-	return err
+	}, ttl)
 }

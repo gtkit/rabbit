@@ -212,11 +212,7 @@ func (f *MQFanout) ConsumeDlx(handler MsgHandler) error {
 // declareExchange 声明 fanout 类型的业务 exchange。
 // 启用 WithDelayedExchange 时声明为 x-delayed-message 类型（底层 fanout）。
 func (f *MQFanout) declareExchange(ch *amqp.Channel) error {
-	if f.opt.delayedExchange {
-		return declareExchangeWithArgs(ch, f.opt.ExchangeName, delayedMessageExchangeType,
-			delayedExchangeArgs(f.opt.ExchangeArgs, amqp.ExchangeFanout))
-	}
-	return declareExchangeWithArgs(ch, f.opt.ExchangeName, amqp.ExchangeFanout, f.opt.ExchangeArgs)
+	return declareBusinessExchange(ch, f.opt.ExchangeName, amqp.ExchangeFanout, f.opt.ExchangeArgs, f.opt.delayedExchange)
 }
 
 // declareBoundQueue 声明主队列并把它（按空 routing key）绑定到 fanout exchange。
@@ -242,36 +238,19 @@ func (f *MQFanout) declareBoundQueue(ch *amqp.Channel, args amqp.Table) (amqp.Qu
 // <exchange>.dlx fanout exchange + <base>.dlq；主队列的 x-dead-letter-exchange 指向 dlx。
 func (f *MQFanout) declareDLXTopology(ch *amqp.Channel) (amqp.Queue, string, error) {
 	dlxExchange := f.opt.ExchangeName + ".dlx"
-	dlqName := f.baseName() + ".dlq"
-
-	if err := ch.ExchangeDeclare(dlxExchange, amqp.ExchangeFanout, true, false, false, false, nil); err != nil {
-		return amqp.Queue{}, "", err
-	}
-
-	queue, err := f.declareBoundQueue(ch, amqp.Table{
-		"x-dead-letter-exchange": dlxExchange,
+	return f.declareDLX(ch, dlxSpec{
+		dlxExchange: dlxExchange,
+		dlxKind:     amqp.ExchangeFanout,
+		dlqName:     f.baseName() + ".dlq",
+		dlqBindKey:  "",
+		declareMain: func(ch *amqp.Channel) (amqp.Queue, error) {
+			return f.declareBoundQueue(ch, amqp.Table{"x-dead-letter-exchange": dlxExchange})
+		},
 	})
-	if err != nil {
-		return amqp.Queue{}, "", err
-	}
-
-	if _, declareErr := ch.QueueDeclare(dlqName, true, false, false, false, nil); declareErr != nil {
-		return amqp.Queue{}, "", declareErr
-	}
-
-	if bindErr := ch.QueueBind(dlqName, "", dlxExchange, false, nil); bindErr != nil {
-		return amqp.Queue{}, "", bindErr
-	}
-
-	return queue, dlqName, nil
 }
 
 // baseName 派生 delay / dlq 队列的命名前缀。
 // 优先用 QueueName；未设置时退回 sanitized 后的 ExchangeName。
 func (f *MQFanout) baseName() string {
-	if strings.TrimSpace(f.opt.QueueName) != "" {
-		return safeNamePart(f.opt.QueueName)
-	}
-
-	return safeNamePart(f.opt.ExchangeName)
+	return deriveBaseName(f.opt.QueueName, f.opt.ExchangeName, "")
 }

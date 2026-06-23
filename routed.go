@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -226,11 +225,7 @@ func (r *routedMQ) ConsumeDlx(handler MsgHandler) error {
 // 启用 WithDelayedExchange 时，业务 exchange 声明为 x-delayed-message 类型
 // （底层仍按 exchangeKind 路由），从而 PublishDelay 可通过 x-delay header 实现延迟。
 func (r *routedMQ) declareExchange(ch *amqp.Channel) error {
-	if r.opt.delayedExchange {
-		return declareExchangeWithArgs(ch, r.opt.ExchangeName, delayedMessageExchangeType,
-			delayedExchangeArgs(r.opt.ExchangeArgs, r.exchangeKind))
-	}
-	return declareExchangeWithArgs(ch, r.opt.ExchangeName, r.exchangeKind, r.opt.ExchangeArgs)
+	return declareBusinessExchange(ch, r.opt.ExchangeName, r.exchangeKind, r.opt.ExchangeArgs, r.opt.delayedExchange)
 }
 
 // declareBoundQueue 声明主队列并把它绑定到业务 exchange + routingKey 上。
@@ -257,51 +252,27 @@ func (r *routedMQ) declareBoundQueue(ch *amqp.Channel, args amqp.Table) (amqp.Qu
 func (r *routedMQ) declareDLXTopology(ch *amqp.Channel) (amqp.Queue, string, error) {
 	dlxExchange := r.opt.ExchangeName + ".dlx"
 	dlxRouting := r.opt.RoutingKey + ".dlx"
-	dlqName := r.baseName() + ".dlq"
-
-	if err := ch.ExchangeDeclare(dlxExchange, r.exchangeKind, true, false, false, false, nil); err != nil {
-		return amqp.Queue{}, "", err
-	}
-
-	queue, err := r.declareBoundQueue(ch, amqp.Table{
-		"x-dead-letter-exchange":    dlxExchange,
-		"x-dead-letter-routing-key": dlxRouting,
+	return r.declareDLX(ch, dlxSpec{
+		dlxExchange: dlxExchange,
+		dlxKind:     r.exchangeKind,
+		dlqName:     r.baseName() + ".dlq",
+		dlqBindKey:  dlxRouting,
+		declareMain: func(ch *amqp.Channel) (amqp.Queue, error) {
+			return r.declareBoundQueue(ch, amqp.Table{
+				"x-dead-letter-exchange":    dlxExchange,
+				"x-dead-letter-routing-key": dlxRouting,
+			})
+		},
 	})
-	if err != nil {
-		return amqp.Queue{}, "", err
-	}
-
-	if _, declareErr := ch.QueueDeclare(dlqName, true, false, false, false, nil); declareErr != nil {
-		return amqp.Queue{}, "", declareErr
-	}
-
-	if bindErr := ch.QueueBind(dlqName, dlxRouting, dlxExchange, false, nil); bindErr != nil {
-		return amqp.Queue{}, "", bindErr
-	}
-
-	return queue, dlqName, nil
 }
 
 // publishRetryMessage 把当前 delivery 投递到 retry queue（带 TTL）。
 // retry queue 的 dead-letter 目标是业务 exchange + routingKey，TTL 到期后自动回到主队列。
 func (r *routedMQ) publishRetryMessage(msg amqp.Delivery, headers amqp.Table, ttl time.Duration) error {
 	retryQueue := r.baseName() + ".retry"
-	messageID := msg.MessageId
-	if messageID == "" {
-		messageID = uuid.NewString()
-	}
-
-	_, err := r.publishGeneric(publishRequest{
-		operation:   "publish retry",
-		body:        msg.Body,
-		msgID:       messageID,
-		routingKey:  retryQueue,
-		mandatory:   true,
-		contentType: msg.ContentType,
-		headers:     headers,
-		expiration:  ttlToString(ttl),
-		priority:    msg.Priority,
-		timestamp:   time.Now(),
+	return r.publishRetry(msg, retrySpec{
+		retryQueue: retryQueue,
+		headers:    headers,
 		declares: []declareStep{
 			{cacheKey: "exchange", declare: r.declareExchange},
 			{cacheKey: "retry:" + retryQueue, declare: func(ch *amqp.Channel) error {
@@ -315,16 +286,11 @@ func (r *routedMQ) publishRetryMessage(msg amqp.Delivery, headers amqp.Table, tt
 				return err
 			}},
 		},
-	})
-	return err
+	}, ttl)
 }
 
 // baseName 派生 retry / delay / dlq 队列的命名前缀。
 // 优先用 QueueName；未设置时退回 exchange + routingKey 的 sanitized 形式。
 func (r *routedMQ) baseName() string {
-	if strings.TrimSpace(r.opt.QueueName) != "" {
-		return safeNamePart(r.opt.QueueName)
-	}
-
-	return safeNamePart(r.opt.ExchangeName) + "." + safeNamePart(r.opt.RoutingKey)
+	return deriveBaseName(r.opt.QueueName, r.opt.ExchangeName, r.opt.RoutingKey)
 }
