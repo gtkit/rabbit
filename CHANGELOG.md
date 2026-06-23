@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-06-23
+
+> 维护版本：**无功能变更**，库代码与 v1.2.1 等价，可直接升级。仅新增持续集成与回归测试。
+
+### Added
+- GitHub Actions CI：离线门禁（vet / golangci-lint / race 单测）+ RabbitMQ 3.13 与 4.x 双 broker 集成测试矩阵
+- RPC 回归测试：调用超时、服务端处理失败不回复、断线后回复队列自动重建
+
 ## [1.2.1] - 2026-06-23
 
 ### Fixed
