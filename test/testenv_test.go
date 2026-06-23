@@ -9,6 +9,15 @@ const defaultMQURL = "amqp://guest:guest@127.0.0.1:5672/"
 
 var mqURL = defaultMQURL
 
+// envOr 返回环境变量 key 的值，未设置时回退到 def。
+// 用于让集成测试的 broker 地址 / Management 凭据在 CI 中可覆盖（本地默认 guest）。
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
 // requireRabbitMQ 用于可结束的集成测试（如 e2e_test.go）。
 // MQ_INTEGRATION=1 启用，MQ_URL 可覆盖连接串。
 func requireRabbitMQ(t *testing.T) {

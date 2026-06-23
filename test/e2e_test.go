@@ -27,10 +27,13 @@ import (
 	"github.com/gtkit/rabbit"
 )
 
-const (
-	mgmtURL  = "http://127.0.0.1:15672"
-	mgmtUser = "guest"
-	mgmtPass = "guest"
+// Management API 地址与凭据，默认 guest（本地 loopback 可用）。
+// CI 中 RabbitMQ service container 的 guest 受 loopback 限制无法远程登录，
+// 通过 MQ_MGMT_URL / MQ_USER / MQ_PASS 覆盖为非 guest 用户。
+var (
+	mgmtURL  = envOr("MQ_MGMT_URL", "http://127.0.0.1:15672")
+	mgmtUser = envOr("MQ_USER", "guest")
+	mgmtPass = envOr("MQ_PASS", "guest")
 )
 
 // uniqueName 生成本次测试用的唯一名字。

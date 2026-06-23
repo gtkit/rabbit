@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-test:
+    name: 离线门禁（vet + lint + race 单测）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+      - name: 离线单测（-race，集成测试自动跳过）
+        run: go test -race -count=1 -timeout=5m ./...
+
+  integration:
+    name: 集成测试（RabbitMQ ${{ matrix.rabbitmq }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 覆盖 3.x 与 4.x；-management 镜像提供 Management API（测试清理/断言需 15672）。
+        # 说明：stock 镜像不含 rabbitmq_delayed_message_exchange 插件，
+        # 两个插件延迟测试会按设计优雅 skip。
+        rabbitmq: ['3.13-management', '4-management']
+    services:
+      rabbitmq:
+        image: rabbitmq:${{ matrix.rabbitmq }}
+        env:
+          # 使用非 guest 用户：guest 受 loopback 限制，无法从 runner 经映射端口远程登录。
+          RABBITMQ_DEFAULT_USER: rabbit
+          RABBITMQ_DEFAULT_PASS: rabbit
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      MQ_INTEGRATION: "1"
+      MQ_URL: "amqp://rabbit:rabbit@127.0.0.1:5672/"
+      MQ_MGMT_URL: "http://127.0.0.1:15672"
+      MQ_USER: rabbit
+      MQ_PASS: rabbit
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 等待 Management API 就绪
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS -u "$MQ_USER:$MQ_PASS" "$MQ_MGMT_URL/api/overview" >/dev/null 2>&1; then
+              echo "management API ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "management API not ready in time" >&2; exit 1
+
+      - name: 集成测试（-race）
+        run: go test ./test -race -count=1 -timeout=10m -v
