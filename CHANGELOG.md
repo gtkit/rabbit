@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-23
+
 ### Added
 - Quorum 队列支持：`WithQueueType(QueueTypeQuorum)`，用于 RabbitMQ 4.x 下的队列高可用（替代已移除的 classic 镜像队列），需 broker 3.8+
 - Stream 队列支持：`NewStream` / `NewPubStream` / `NewConsumeStream` + `MQStream` + `StreamOffset`（`OffsetFirst` / `OffsetLast` / `OffsetNext`），适合大数据量 / 消息重放，需 broker 3.9+

@@ -21,6 +21,26 @@
 
 项目最低需 `Go 1.22`（使用 `range over int`、`maps.Copy` 等现代特性）。
 
+### 版本兼容性
+
+底层使用 `github.com/rabbitmq/amqp091-go`（AMQP 0-9-1 协议，由 RabbitMQ 团队维护）。AMQP 0-9-1 在 RabbitMQ 4.x 中**仍是一等协议、未被废弃**，因此本包**同时支持 RabbitMQ 3.x 与 4.x**。核心功能用的都是长期稳定的核心原语；少数能力按 broker 版本门控（opt-in，不影响默认兼容性）。
+
+| 能力 | 最低 broker | 3.x | 4.x |
+|------|------------|-----|-----|
+| simple / direct / topic / fanout / headers 五种模式 | 维护中的 3.x | ✅ | ✅ |
+| 持久化、Publisher Confirm、自动重连 | — | ✅ | ✅ |
+| retry（`x-retry`）、DLX / DLQ、RPC | — | ✅ | ✅ |
+| 分桶延迟（默认，仅 TTL + DLX，零依赖） | — | ✅ | ✅ |
+| mandatory / Return 不可路由感知、连接隔离、`BlockObserver` | — | ✅ | ✅ |
+| **Quorum 队列**（`WithQueueType(QueueTypeQuorum)`） | **3.8+** | ✅ | ✅ |
+| **Stream 队列**（`NewStream`） | **3.9+** | ✅ | ✅ |
+| **插件延迟**（`WithDelayedExchange`） | 视插件 | ⚠️ | ⚠️ |
+
+- **建议支持下限：RabbitMQ 3.8+**（可用上 quorum 的最早版本；3.8 以下已 EOL）。
+- **RabbitMQ 4.0 起移除了 classic 镜像队列**——在 4.x 上要队列高可用，请用 `WithQueueType(QueueTypeQuorum)`。
+- **插件延迟**需安装 `rabbitmq_delayed_message_exchange`，且**插件版本须匹配 broker**（社区插件通常滞后 broker 一个 minor，例如当前最高支持 4.2.x）；无插件时默认走分桶延迟。
+- 已实测全量集成测试通过的 broker 版本：**3.12.1 / 4.2.8 / 4.3.2**。
+
 ## 一、特性概览
 
 - 支持 `simple`、`direct`、`fanout`、`topic`、`headers`、`stream` 六种 RabbitMQ 模式
