@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-06-23
+
 ### Fixed
 - `WithQueueType` 非法值（如拼写错误 `"qurom"`）现在在配置归一化阶段直接返回 error，不再静默退回 classic 并忽略 `WithDeliveryLimit`
 - 修正 `WithQueueArgs` 的 GoDoc：如实描述参数合并优先级（用户参数原样并入、库按 QueueType 写入的保留键优先），此前文档与实现不符
