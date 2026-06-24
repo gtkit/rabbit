@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Added
+- 消费幂等 / 去重（可选）：`IdempotentHandler` 装饰器 + `IdempotentStore` 存储接口 + 内置 `MemoryStore`，默认不开启，存储故障 fail-open。分布式多实例可注入 Redis 等共享实现，单机 / 测试用 `MemoryStore`
+
 ## [1.2.2] - 2026-06-23
 
 > 维护版本：**无功能变更**，库代码与 v1.2.1 等价，可直接升级。仅新增持续集成与回归测试。
