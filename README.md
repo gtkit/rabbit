@@ -154,7 +154,11 @@ defer mq.Destroy()
 
 ### 5. 消费幂等 / 去重（可选）
 
-本库消费语义是 at-least-once：消费者处理完业务但在 `Ack` 之前崩溃 / 断网时，broker 会重新投递，导致重复消费。库默认不做去重（由业务自行幂等），并提供一个可选、零侵入的装饰器 `IdempotentHandler` 帮你接住这件事。
+本库消费语义是 at-least-once：消费者处理完业务但在 `Ack` 之前崩溃 / 断网时，broker 会重新投递，导致重复消费。库默认不做去重（由业务自行幂等），并提供两层可选、零侵入的装饰器。
+
+#### 简单去重：`IdempotentHandler`
+
+适合 ACK 丢失后的顺序重投拦截；默认 fail-open，不改变可用性优先策略。
 
 ```go
 // 1. 准备去重存储。单机 / 测试用内置 MemoryStore；
@@ -190,6 +194,134 @@ handler := rabbit.IdempotentHandler(myHandler, store,
 
 - **故障策略 fail-open**：存储查询 / 提交报错时记录日志并放行，保证存储抖动不丢消息，代价是故障期可能漏去重（重复）。
 - **局限**：无法消除“处理成功但 `Commit` 前进程崩溃”这一极小窗口的重复——这是 exactly-once 的固有限制，严格场景请在业务侧用数据库唯一键 / 事务兜底。`MemoryStore` 仅用于单机；`ttl<=0` 时永不过期，长跑进程务必设置 TTL。
+- **并发窗口**：`IsDuplicate → Process → Commit` 非原子，能拦顺序重投，但拦不住同一 key 的并发重复（多个 worker 同时通过 `IsDuplicate` 后各处理一次）。需并发去重时，使用下面的原子 claim 方案。
+
+#### 原子 claim 去重：`IdempotentClaimHandler`
+
+适合订单、支付、库存等需要“唯一业务键 + 去重记录 + 状态机”的生产场景。它在业务处理前抢占 key，业务成功后标记完成，业务失败时释放占位；存储错误返回 error，复用现有 retry / DLX。
+
+```go
+store := rabbit.NewMemoryClaimStore(time.Minute, 10*time.Minute)
+handler := rabbit.IdempotentClaimHandler(myHandler, store,
+    rabbit.WithClaimDedupKey(func(body []byte, msgID string) (string, bool) {
+        return parseOrderID(body), true
+    }),
+)
+_ = cons.Consume(handler)
+```
+
+原子 claim 存储接口：
+
+```go
+type IdempotentClaimStore interface {
+    Claim(ctx context.Context, key string) (IdempotentClaim, error)
+    Commit(ctx context.Context, key, token string) error
+    Release(ctx context.Context, key, token string) error
+}
+```
+
+`Claim` 三态：
+
+| 状态 | 含义 | 装饰器行为 |
+|------|------|------------|
+| `IdempotentClaimAcquired` | 本次抢占成功 | 执行业务，成功后 `Commit` |
+| `IdempotentClaimDuplicate` | 已完成重复消息 | 跳过业务并返回 `nil`，由消费流程 `Ack` |
+| `IdempotentClaimInProgress` | 同 key 正在处理 | 返回 `ErrIdempotentInProgress`，走 retry / DLX |
+
+生产建议：
+
+- 默认优先用业务唯一键，不要只依赖 `msgID`；生产者重试重新发布时，业务相同但 `msgID` 可能不同。
+- 分布式多实例必须接共享存储。Redis 可用 `SETNX + TTL + value token` 表达处理中租约；数据库可用唯一键 / 去重表表达状态机。
+- 强一致场景把业务写入与去重完成状态放在同一数据库事务中；否则“业务成功但 `Commit` 失败 / 进程崩溃”仍可能重复。
+- `MemoryClaimStore` 仅用于单机 / 测试；`processingTTL` 应覆盖正常业务处理时长，`doneTTL` 应覆盖可接受的重复投递窗口。
+
+#### 生产落地：5 类方案怎么选
+
+| 方案 | 放在哪里做 | 适合场景 | 与本库关系 |
+|------|------------|----------|------------|
+| 唯一消息 ID + 去重表 | 消费装饰器 / 业务存储 | 通用重复消费拦截 | `IdempotentHandler` / `IdempotentClaimHandler` |
+| 数据库唯一约束 | 业务数据库 | 下单、充值、创建流水等新增类操作 | 业务侧事务兜底 |
+| Redis `SETNX` | 共享缓存 | 高并发、低延迟、允许按 TTL 释放处理中占位 | 实现 `IdempotentClaimStore` |
+| 乐观锁 / 版本号 | 业务数据库 | 扣库存、改余额等更新类操作 | 业务侧更新条件 |
+| 业务状态机 | 业务服务 | 订单、工单、支付等有明确状态流转的业务 | 业务侧最终防线 |
+
+**Redis claim store 实现要点（伪代码，不绑定具体 client）：**
+
+```text
+Claim(key):
+  token = random()
+  ok = SET key token NX PX processingTTL
+  if ok:
+    return Acquired(token)
+
+  value = GET key
+  if value == "DONE":
+    return Duplicate
+  return InProgress
+
+Commit(key, token):
+  if GET key != token:
+    return ErrIdempotentClaimLost
+  SET key "DONE" PX doneTTL
+
+Release(key, token):
+  if GET key == token:
+    DEL key
+```
+
+`Commit` / `Release` 必须校验 token；Redis 实现应使用 Lua 或等价的原子比较删除 / 比较更新，避免租约过期后旧消费者误操作新消费者的 claim。
+
+**数据库去重表示例（示意 DDL）：**
+
+```sql
+CREATE TABLE message_dedup (
+  dedup_key    VARCHAR(128) PRIMARY KEY,
+  status       VARCHAR(16) NOT NULL,
+  token        VARCHAR(64) NOT NULL,
+  expire_at    TIMESTAMP NOT NULL,
+  created_at   TIMESTAMP NOT NULL,
+  updated_at   TIMESTAMP NOT NULL
+);
+```
+
+事务建议：
+
+```text
+BEGIN
+  INSERT dedup_key/status=PROCESSING/token
+  -- 如果主键冲突：读取状态，DONE 跳过，PROCESSING 走重试
+  执行业务写入
+  UPDATE message_dedup SET status=DONE WHERE dedup_key=? AND token=?
+COMMIT
+```
+
+如果业务数据和去重表在同一个数据库，优先把“业务写入 + 去重完成状态”放在同一事务里。这样可以收窄“业务成功但 ACK 前断链”的重复窗口。
+
+**业务侧兜底示例：**
+
+新增类操作用唯一约束：
+
+```sql
+ALTER TABLE orders ADD CONSTRAINT uk_orders_order_no UNIQUE (order_no);
+```
+
+更新类操作用乐观锁：
+
+```sql
+UPDATE inventory
+SET stock = stock - 1, version = version + 1
+WHERE sku_id = ? AND stock > 0 AND version = ?;
+```
+
+状态机操作只允许单向流转：
+
+```sql
+UPDATE orders
+SET status = 'PAID'
+WHERE order_no = ? AND status = 'WAIT_PAY';
+```
+
+RabbitMQ 层的去重用于减少重复执行业务逻辑；数据库唯一约束、乐观锁和业务状态机用于保证最终业务结果正确。高价值业务建议两层都做。
 
 ## 五、通用配置项
 

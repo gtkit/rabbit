@@ -56,3 +56,22 @@ func ExampleIdempotentHandler_customKey() {
 	// Output:
 	// 处理订单: order-2002
 }
+
+// ExampleIdempotentClaimHandler 演示用原子 claim 状态机做生产级消费幂等。
+// 分布式多实例请注入基于 Redis SETNX 或数据库唯一键 / 去重表的共享实现。
+func ExampleIdempotentClaimHandler() {
+	store := rabbit.NewMemoryClaimStore(time.Minute, 10*time.Minute)
+	handler := rabbit.IdempotentClaimHandler(orderHandler{}, store,
+		rabbit.WithClaimDedupKey(func(body []byte, _ string) (string, bool) {
+			// 真实场景从 body 解析订单号、支付流水号或事件 ID。
+			return string(body), len(body) > 0
+		}),
+	)
+
+	// 第一条消息抢占 key 并处理成功；第二条业务 key 相同，直接跳过。
+	_ = handler.Process([]byte("order-3003"), "msg-a")
+	_ = handler.Process([]byte("order-3003"), "msg-b")
+
+	// Output:
+	// 处理订单: order-3003
+}

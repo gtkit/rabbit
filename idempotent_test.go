@@ -77,6 +77,55 @@ func (s *idemFakeStore) isCommitted(key string) bool {
 	return ok
 }
 
+// idemFakeClaimStore 是可编程的 IdempotentClaimStore。
+type idemFakeClaimStore struct {
+	mu            sync.Mutex
+	claimStatus   IdempotentClaimStatus
+	claimErr      error
+	commitErr     error
+	releaseErr    error
+	claimKeys     []string
+	commitKeys    []string
+	commitTokens  []string
+	releaseKeys   []string
+	releaseTokens []string
+	claimCalls    int
+	commitCalls   int
+	releaseCalls  int
+}
+
+func (s *idemFakeClaimStore) Claim(_ context.Context, key string) (IdempotentClaim, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.claimCalls++
+	s.claimKeys = append(s.claimKeys, key)
+	if s.claimErr != nil {
+		return IdempotentClaim{}, s.claimErr
+	}
+	if s.claimStatus == 0 {
+		return IdempotentClaim{Status: IdempotentClaimAcquired, Token: "token"}, nil
+	}
+	return IdempotentClaim{Status: s.claimStatus, Token: "token"}, nil
+}
+
+func (s *idemFakeClaimStore) Commit(_ context.Context, key, token string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.commitCalls++
+	s.commitKeys = append(s.commitKeys, key)
+	s.commitTokens = append(s.commitTokens, token)
+	return s.commitErr
+}
+
+func (s *idemFakeClaimStore) Release(_ context.Context, key, token string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.releaseCalls++
+	s.releaseKeys = append(s.releaseKeys, key)
+	s.releaseTokens = append(s.releaseTokens, token)
+	return s.releaseErr
+}
+
 func TestIdempotentHandler_FirstMessageProcessedAndCommitted(t *testing.T) {
 	next := &idemRecHandler{}
 	store := newIdemFakeStore()
@@ -177,6 +226,15 @@ func TestIdempotentHandler_NilStoreReturnsNext(t *testing.T) {
 	}
 }
 
+func TestIdempotentHandler_NilNextReturnsNil(t *testing.T) {
+	// next 为 nil 时必须返回 nil，而非包裹 nil 的非 nil 装饰器，
+	// 否则会绕过 Consume* 的 ErrHandlerRequired 校验并在处理时 panic。
+	store := newIdemFakeStore()
+	if h := IdempotentHandler(nil, store); h != nil {
+		t.Fatalf("nil next must return nil handler, got %#v", h)
+	}
+}
+
 func TestIdempotentHandler_IsDuplicateErrorFailOpen(t *testing.T) {
 	next := &idemRecHandler{}
 	store := newIdemFakeStore()
@@ -224,8 +282,8 @@ func TestMemoryStore_DuplicateWithinTTL(t *testing.T) {
 	store := NewMemoryStore(time.Minute)
 	ctx := context.Background()
 
-	if err := store.Commit(ctx, "k1"); err != nil {
-		t.Fatalf("Commit error: %v", err)
+	if commitErr := store.Commit(ctx, "k1"); commitErr != nil {
+		t.Fatalf("Commit error: %v", commitErr)
 	}
 	dup, err := store.IsDuplicate(ctx, "k1")
 	if err != nil {
@@ -290,6 +348,35 @@ func TestMemoryStore_SweepEvictsExpired(t *testing.T) {
 	}
 }
 
+func TestMemoryStore_ZeroValueUsable(t *testing.T) {
+	// 零值 MemoryStore 必须可直接使用（懒初始化 seen），等价于永不过期。
+	var store MemoryStore
+	ctx := context.Background()
+
+	if err := store.Commit(ctx, "z1"); err != nil {
+		t.Fatalf("zero-value Commit error: %v", err)
+	}
+	dup, err := store.IsDuplicate(ctx, "z1")
+	if err != nil {
+		t.Fatalf("zero-value IsDuplicate error: %v", err)
+	}
+	if !dup {
+		t.Fatalf("zero-value store must report committed key as duplicate")
+	}
+}
+
+func TestMemoryStore_ZeroValueIsDuplicateUnknown(t *testing.T) {
+	// 未 Commit 前对零值 store 查重不得 panic（读 nil map 安全）。
+	var store MemoryStore
+	dup, err := store.IsDuplicate(context.Background(), "never")
+	if err != nil {
+		t.Fatalf("zero-value IsDuplicate error: %v", err)
+	}
+	if dup {
+		t.Fatalf("unknown key must not be duplicate")
+	}
+}
+
 func TestMemoryStore_Concurrent(t *testing.T) {
 	store := NewMemoryStore(time.Minute)
 	ctx := context.Background()
@@ -303,6 +390,348 @@ func TestMemoryStore_Concurrent(t *testing.T) {
 			_, _ = store.IsDuplicate(ctx, key)
 			_ = store.Commit(ctx, key)
 			_, _ = store.IsDuplicate(ctx, key)
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestIdempotentClaimHandler_AcquiredProcessedAndCommitted(t *testing.T) {
+	next := &idemRecHandler{}
+	store := &idemFakeClaimStore{}
+	h := IdempotentClaimHandler(next, store)
+
+	if err := h.Process([]byte("payload"), "msg-1"); err != nil {
+		t.Fatalf("Process error: %v", err)
+	}
+	if got := next.processCount(); got != 1 {
+		t.Fatalf("next.Process called %d times, want 1", got)
+	}
+	if store.commitCalls != 1 || store.commitKeys[0] != "msg-1" {
+		t.Fatalf("Commit calls = %d keys=%v, want key msg-1", store.commitCalls, store.commitKeys)
+	}
+	if store.commitTokens[0] != "token" {
+		t.Fatalf("Commit token = %q, want token", store.commitTokens[0])
+	}
+	if store.releaseCalls != 0 {
+		t.Fatalf("Release called %d times, want 0", store.releaseCalls)
+	}
+}
+
+func TestIdempotentClaimHandler_CompletedDuplicateSkipped(t *testing.T) {
+	next := &idemRecHandler{}
+	store := &idemFakeClaimStore{claimStatus: IdempotentClaimDuplicate}
+	h := IdempotentClaimHandler(next, store)
+
+	if err := h.Process([]byte("payload"), "msg-dup"); err != nil {
+		t.Fatalf("Process error: %v", err)
+	}
+	if got := next.processCount(); got != 0 {
+		t.Fatalf("next.Process called %d times, want 0", got)
+	}
+	if store.commitCalls != 0 || store.releaseCalls != 0 {
+		t.Fatalf("commit/release calls = %d/%d, want 0/0", store.commitCalls, store.releaseCalls)
+	}
+}
+
+func TestIdempotentClaimHandler_InProgressReturnsSentinel(t *testing.T) {
+	next := &idemRecHandler{}
+	store := &idemFakeClaimStore{claimStatus: IdempotentClaimInProgress}
+	h := IdempotentClaimHandler(next, store)
+
+	err := h.Process([]byte("payload"), "msg-busy")
+	if !errors.Is(err, ErrIdempotentInProgress) {
+		t.Fatalf("Process error = %v, want ErrIdempotentInProgress", err)
+	}
+	if got := next.processCount(); got != 0 {
+		t.Fatalf("next.Process called %d times, want 0", got)
+	}
+}
+
+func TestIdempotentClaimHandler_KeyUnavailableBypassesClaim(t *testing.T) {
+	next := &idemRecHandler{}
+	store := &idemFakeClaimStore{}
+	h := IdempotentClaimHandler(next, store)
+
+	if err := h.Process([]byte("payload"), ""); err != nil {
+		t.Fatalf("Process error: %v", err)
+	}
+	if got := next.processCount(); got != 1 {
+		t.Fatalf("next.Process called %d times, want 1", got)
+	}
+	if store.claimCalls != 0 {
+		t.Fatalf("Claim called %d times, want 0", store.claimCalls)
+	}
+}
+
+func TestIdempotentClaimHandler_CustomBusinessKey(t *testing.T) {
+	next := &idemRecHandler{}
+	store := NewMemoryClaimStore(time.Minute, time.Minute)
+	h := IdempotentClaimHandler(next, store, WithClaimDedupKey(func(body []byte, _ string) (string, bool) {
+		return string(body), len(body) > 0
+	}))
+
+	if err := h.Process([]byte("order-9"), "msg-a"); err != nil {
+		t.Fatalf("first Process error: %v", err)
+	}
+	if err := h.Process([]byte("order-9"), "msg-b"); err != nil {
+		t.Fatalf("second Process error: %v", err)
+	}
+	if got := next.processCount(); got != 1 {
+		t.Fatalf("next.Process called %d times, want 1", got)
+	}
+}
+
+func TestIdempotentClaimHandler_ProcessFailureReleasesClaim(t *testing.T) {
+	wantErr := errors.New("business failure")
+	next := &idemRecHandler{err: wantErr}
+	store := &idemFakeClaimStore{}
+	h := IdempotentClaimHandler(next, store)
+
+	if err := h.Process([]byte("payload"), "msg-fail"); !errors.Is(err, wantErr) {
+		t.Fatalf("Process error = %v, want %v", err, wantErr)
+	}
+	if store.releaseCalls != 1 || store.releaseKeys[0] != "msg-fail" {
+		t.Fatalf("Release calls = %d keys=%v, want key msg-fail", store.releaseCalls, store.releaseKeys)
+	}
+	if store.releaseTokens[0] != "token" {
+		t.Fatalf("Release token = %q, want token", store.releaseTokens[0])
+	}
+	if store.commitCalls != 0 {
+		t.Fatalf("Commit called %d times, want 0", store.commitCalls)
+	}
+}
+
+func TestIdempotentClaimHandler_ReleaseErrorPreservesBothErrors(t *testing.T) {
+	businessErr := errors.New("business failure")
+	releaseErr := errors.New("release failed")
+	next := &idemRecHandler{err: businessErr}
+	store := &idemFakeClaimStore{releaseErr: releaseErr}
+	h := IdempotentClaimHandler(next, store)
+
+	err := h.Process([]byte("payload"), "msg-release")
+	if !errors.Is(err, businessErr) {
+		t.Fatalf("Process error = %v, want business error", err)
+	}
+	if !errors.Is(err, releaseErr) {
+		t.Fatalf("Process error = %v, want release error", err)
+	}
+}
+
+func TestIdempotentClaimHandler_StoreErrors(t *testing.T) {
+	t.Run("claim error", func(t *testing.T) {
+		wantErr := errors.New("redis down")
+		next := &idemRecHandler{}
+		store := &idemFakeClaimStore{claimErr: wantErr}
+		h := IdempotentClaimHandler(next, store)
+
+		if err := h.Process([]byte("payload"), "msg-claim"); !errors.Is(err, wantErr) {
+			t.Fatalf("Process error = %v, want %v", err, wantErr)
+		}
+		if got := next.processCount(); got != 0 {
+			t.Fatalf("next.Process called %d times, want 0", got)
+		}
+	})
+
+	t.Run("commit error", func(t *testing.T) {
+		wantErr := errors.New("commit failed")
+		next := &idemRecHandler{}
+		store := &idemFakeClaimStore{commitErr: wantErr}
+		h := IdempotentClaimHandler(next, store)
+
+		if err := h.Process([]byte("payload"), "msg-commit"); !errors.Is(err, wantErr) {
+			t.Fatalf("Process error = %v, want %v", err, wantErr)
+		}
+		if got := next.processCount(); got != 1 {
+			t.Fatalf("next.Process called %d times, want 1", got)
+		}
+	})
+}
+
+func TestIdempotentClaimHandler_InvalidClaimStatus(t *testing.T) {
+	next := &idemRecHandler{}
+	store := &idemFakeClaimStore{claimStatus: IdempotentClaimStatus(99)}
+	h := IdempotentClaimHandler(next, store)
+
+	if err := h.Process([]byte("payload"), "msg-invalid"); err == nil {
+		t.Fatal("Process error = nil, want invalid status error")
+	}
+	if got := next.processCount(); got != 0 {
+		t.Fatalf("next.Process called %d times, want 0", got)
+	}
+}
+
+func TestIdempotentClaimHandler_NilInputs(t *testing.T) {
+	next := &idemRecHandler{}
+	if h := IdempotentClaimHandler(next, nil); h != MsgHandler(next) {
+		t.Fatalf("nil store must return next handler unchanged")
+	}
+	if h := IdempotentClaimHandler(nil, &idemFakeClaimStore{}); h != nil {
+		t.Fatalf("nil next must return nil handler, got %#v", h)
+	}
+}
+
+func TestIdempotentClaimHandler_FailedPassthrough(t *testing.T) {
+	next := &idemRecHandler{}
+	h := IdempotentClaimHandler(next, &idemFakeClaimStore{})
+
+	h.Failed(FailedMsg{QueueName: "q", MessageID: "m", Message: []byte("b")})
+
+	next.mu.Lock()
+	defer next.mu.Unlock()
+	if len(next.failed) != 1 || next.failed[0].MessageID != "m" {
+		t.Fatalf("Failed not passed through to next: %+v", next.failed)
+	}
+}
+
+func TestMemoryClaimStore_CompletedDuplicateWithinTTL(t *testing.T) {
+	store := NewMemoryClaimStore(time.Minute, time.Minute)
+	ctx := context.Background()
+
+	claim, err := store.Claim(ctx, "k1")
+	if err != nil || claim.Status != IdempotentClaimAcquired {
+		t.Fatalf("Claim = %+v, %v; want acquired nil", claim, err)
+	}
+	if commitErr := store.Commit(ctx, "k1", claim.Token); commitErr != nil {
+		t.Fatalf("Commit error: %v", commitErr)
+	}
+	claim, err = store.Claim(ctx, "k1")
+	if err != nil || claim.Status != IdempotentClaimDuplicate {
+		t.Fatalf("Claim duplicate = %+v, %v; want duplicate nil", claim, err)
+	}
+}
+
+func TestMemoryClaimStore_ProcessingDuplicateWithinTTL(t *testing.T) {
+	store := NewMemoryClaimStore(time.Minute, time.Minute)
+	ctx := context.Background()
+
+	claim, err := store.Claim(ctx, "k2")
+	if err != nil || claim.Status != IdempotentClaimAcquired {
+		t.Fatalf("first Claim = %+v, %v; want acquired nil", claim, err)
+	}
+	claim, err = store.Claim(ctx, "k2")
+	if err != nil || claim.Status != IdempotentClaimInProgress {
+		t.Fatalf("second Claim = %+v, %v; want in-progress nil", claim, err)
+	}
+}
+
+func TestMemoryClaimStore_ProcessingExpiryAllowsReclaim(t *testing.T) {
+	store := NewMemoryClaimStore(20*time.Millisecond, time.Minute)
+	ctx := context.Background()
+
+	claim, err := store.Claim(ctx, "k3")
+	if err != nil || claim.Status != IdempotentClaimAcquired {
+		t.Fatalf("first Claim = %+v, %v; want acquired nil", claim, err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	claim, err = store.Claim(ctx, "k3")
+	if err != nil || claim.Status != IdempotentClaimAcquired {
+		t.Fatalf("expired Claim = %+v, %v; want acquired nil", claim, err)
+	}
+}
+
+func TestMemoryClaimStore_ReleaseAllowsReclaim(t *testing.T) {
+	store := NewMemoryClaimStore(time.Minute, time.Minute)
+	ctx := context.Background()
+
+	claim, err := store.Claim(ctx, "k4")
+	if err != nil || claim.Status != IdempotentClaimAcquired {
+		t.Fatalf("Claim = %+v, %v; want acquired nil", claim, err)
+	}
+	if releaseErr := store.Release(ctx, "k4", claim.Token); releaseErr != nil {
+		t.Fatalf("Release error: %v", releaseErr)
+	}
+	claim, err = store.Claim(ctx, "k4")
+	if err != nil || claim.Status != IdempotentClaimAcquired {
+		t.Fatalf("Claim after release = %+v, %v; want acquired nil", claim, err)
+	}
+}
+
+func TestMemoryClaimStore_ReleaseDoesNotDeleteCompleted(t *testing.T) {
+	store := NewMemoryClaimStore(time.Minute, time.Minute)
+	ctx := context.Background()
+
+	claim, err := store.Claim(ctx, "k5")
+	if err != nil || claim.Status != IdempotentClaimAcquired {
+		t.Fatalf("Claim = %+v, %v; want acquired nil", claim, err)
+	}
+	if commitErr := store.Commit(ctx, "k5", claim.Token); commitErr != nil {
+		t.Fatalf("Commit error: %v", commitErr)
+	}
+	if releaseErr := store.Release(ctx, "k5", claim.Token); releaseErr != nil {
+		t.Fatalf("Release error: %v", releaseErr)
+	}
+	claim, err = store.Claim(ctx, "k5")
+	if err != nil || claim.Status != IdempotentClaimDuplicate {
+		t.Fatalf("Claim after release completed = %+v, %v; want duplicate nil", claim, err)
+	}
+}
+
+func TestMemoryClaimStore_StaleReleaseDoesNotDeleteNewClaim(t *testing.T) {
+	store := NewMemoryClaimStore(20*time.Millisecond, time.Minute)
+	ctx := context.Background()
+
+	first, err := store.Claim(ctx, "k6")
+	if err != nil || first.Status != IdempotentClaimAcquired {
+		t.Fatalf("first Claim = %+v, %v; want acquired nil", first, err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	second, err := store.Claim(ctx, "k6")
+	if err != nil || second.Status != IdempotentClaimAcquired {
+		t.Fatalf("second Claim = %+v, %v; want acquired nil", second, err)
+	}
+	if first.Token == second.Token {
+		t.Fatalf("tokens must differ after reclaim, got %q", first.Token)
+	}
+	if releaseErr := store.Release(ctx, "k6", first.Token); releaseErr != nil {
+		t.Fatalf("stale Release error: %v", releaseErr)
+	}
+	claim, err := store.Claim(ctx, "k6")
+	if err != nil || claim.Status != IdempotentClaimInProgress {
+		t.Fatalf("Claim after stale release = %+v, %v; want in-progress nil", claim, err)
+	}
+}
+
+func TestMemoryClaimStore_StaleCommitReturnsClaimLost(t *testing.T) {
+	store := NewMemoryClaimStore(20*time.Millisecond, time.Minute)
+	ctx := context.Background()
+
+	first, err := store.Claim(ctx, "k7")
+	if err != nil || first.Status != IdempotentClaimAcquired {
+		t.Fatalf("first Claim = %+v, %v; want acquired nil", first, err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	second, err := store.Claim(ctx, "k7")
+	if err != nil || second.Status != IdempotentClaimAcquired {
+		t.Fatalf("second Claim = %+v, %v; want acquired nil", second, err)
+	}
+	if commitErr := store.Commit(ctx, "k7", first.Token); !errors.Is(commitErr, ErrIdempotentClaimLost) {
+		t.Fatalf("stale Commit error = %v, want ErrIdempotentClaimLost", commitErr)
+	}
+	claim, err := store.Claim(ctx, "k7")
+	if err != nil || claim.Status != IdempotentClaimInProgress {
+		t.Fatalf("Claim after stale commit = %+v, %v; want in-progress nil", claim, err)
+	}
+}
+
+func TestMemoryClaimStore_Concurrent(t *testing.T) {
+	store := NewMemoryClaimStore(time.Minute, time.Minute)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	for i := range 50 {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			key := "k-" + strconv.Itoa(n%10)
+			claim, _ := store.Claim(ctx, key)
+			if claim.Status == IdempotentClaimAcquired {
+				if n%2 == 0 {
+					_ = store.Commit(ctx, key, claim.Token)
+				} else {
+					_ = store.Release(ctx, key, claim.Token)
+				}
+			}
+			_, _ = store.Claim(ctx, key)
 		}(i)
 	}
 	wg.Wait()

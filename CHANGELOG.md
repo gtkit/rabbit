@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ### Added
 - 消费幂等 / 去重（可选）：`IdempotentHandler` 装饰器 + `IdempotentStore` 存储接口 + 内置 `MemoryStore`，默认不开启，存储故障 fail-open。分布式多实例可注入 Redis 等共享实现，单机 / 测试用 `MemoryStore`
+- 原子 claim 消费幂等（可选）：`IdempotentClaimHandler` + `IdempotentClaimStore` + 内置 `MemoryClaimStore`，支持处理中 / 已完成状态区分，适合基于业务唯一键、Redis `SETNX` 或数据库去重表的生产级重复消费控制
 
 ## [1.2.2] - 2026-06-23
 
